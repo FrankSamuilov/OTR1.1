@@ -36,8 +36,8 @@ def load_positions(client, logger=None):
                     "position_side": position_side,
                     "target_profit": 0.0,
                     # 使用从交易所获取的值，如果没有则使用默认值
-                    "dynamic_take_profit": float(pos.get("takeProfit", 0.0175)),  # 默认使用2.5%止盈
-                    "stop_loss": float(pos.get("stopLoss", -0.0125)),  # 默认使用1.75%止损
+                    "dynamic_take_profit": float(pos.get("takeProfit", 0.025)),  # 默认使用2.5%止盈
+                    "stop_loss": float(pos.get("stopLoss", -0.0175)),  # 默认使用1.75%止损
                     "last_check_time": time.time(),
                     "last_check_price": float(pos.get("markPrice", 0)),
                     "position_id": f"{pos['symbol']}_{position_side}_{int(time.time())}"
@@ -52,8 +52,8 @@ def load_positions(client, logger=None):
                     "position_side": position_side,
                     "target_profit": 0.0,
                     # 使用从交易所获取的值，如果没有则使用默认值
-                    "dynamic_take_profit": float(pos.get("takeProfit", 0.0175)),  # 默认使用2.5%止盈
-                    "stop_loss": float(pos.get("stopLoss", -0.0125)),  # 默认使用1.75%止损
+                    "dynamic_take_profit": float(pos.get("takeProfit", 0.025)),  # 默认使用2.5%止盈
+                    "stop_loss": float(pos.get("stopLoss", -0.0175)),  # 默认使用1.75%止损
                     "last_check_time": time.time(),
                     "last_check_price": float(pos.get("markPrice", 0)),
                     "position_id": f"{pos['symbol']}_{position_side}_{int(time.time())}"

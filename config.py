@@ -1,7 +1,6 @@
 CONFIG = {
     "USER_REQUEST": "placeholder_value",  # Replace with the actual configuration or remove if unnecessary
-    "TRADE_PAIRS": ["XRPUSDT", "DOGEUSDT", "BNBUSDT", "VINEUSDT", "TSTUSDT", "AIXBTUSDT", "IPUSDT", "SUSDT", "KAIBUSDT",
-                    "SUIUSDT","WIFUSDC","BBUSDT","REDUSDT","EPICUSDT","ETHUSDT",],
+    "TRADE_PAIRS": ["XRPUSDT","SUIUSDC", "BBUSDT","DOGEUSDT","SUSDT","BNBUSDT","VINEUSDT","XPRUSDT","BTCUSDC","BNBUSDT","DOGEUSDT","ETHUSDC"],
     "TRADE_PERCENTAGE": 0.8,
     "MAX_LEVERAGE": 1,
     "MIN_NOTIONAL": 30,
@@ -19,7 +18,12 @@ CONFIG = {
     "MAX_HOLD_TIME": 300,
     "MIN_MARGIN_BALANCE": 10,
     "TREND_DURATION_THRESHOLD": 1440,
-    "ATR_HEDGE_THRESHOLD": 1.5
+    "ATR_HEDGE_THRESHOLD": 1.5,
+    "INITIAL_STOP_LOSS": 0.008,  # 初始止损百分比 (0.8%)
+    "TRAILING_ACTIVATION": 0.012,  # 激活跟踪止损的价格变动阈值 (1.2%)
+    "TRAILING_MIN_DISTANCE": 0.002,  # 最小跟踪距离 (0.2%)
+    "TRAILING_MAX_DISTANCE": 0.004,  # 最大跟踪距离 (0.4%)
+    "MIN_PRICE_MOVEMENT": 0.0125,  # 最小价格变动阈值 (1.25%)
 }
 
 VERSION = "1.2.5.9.9"

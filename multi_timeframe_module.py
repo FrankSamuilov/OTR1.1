@@ -10,7 +10,10 @@ import time
 from logger_utils import Colors, print_colored
 from indicators_module import calculate_optimized_indicators, get_smc_trend_and_duration
 
+
 class MultiTimeframeCoordinator:
+    """多时间框架协调类，用于在不同时间框架上进行分析并协调决策"""
+
     def __init__(self, client, logger=None):
         """初始化多时间框架协调器
 
@@ -21,79 +24,22 @@ class MultiTimeframeCoordinator:
         self.client = client
         self.logger = logger
         self.timeframes = {
+            "1m": {"interval": "1m", "weight": 0.5, "data": {}, "last_update": {}},
             "5m": {"interval": "5m", "weight": 0.7, "data": {}, "last_update": {}},
             "15m": {"interval": "15m", "weight": 1.0, "data": {}, "last_update": {}},
             "1h": {"interval": "1h", "weight": 1.5, "data": {}, "last_update": {}},
-            "2h": {"interval": "2h", "weight": 1.8, "data": {}, "last_update": {}}
+            "4h": {"interval": "4h", "weight": 2.0, "data": {}, "last_update": {}}
         }
         self.update_interval = {
-            "5m": 150,  # 5min K线每2.5分钟更新一次
-            "15m": 300,  # 15min K线每5分钟更新一次
-            "1h": 900,  # 1h K线每15分钟更新一次
-            "2h": 1800  # 2h K线每30分钟更新一次
+            "1m": 60,  # 1分钟K线每1分钟更新一次
+            "5m": 300,  # 5分钟K线每5分钟更新一次
+            "15m": 600,  # 15分钟K线每10分钟更新一次
+            "1h": 1800,  # 1小时K线每30分钟更新一次
+            "4h": 3600  # 4小时K线每60分钟更新一次
         }
         self.coherence_cache = {}  # 缓存一致性分析结果
 
         print_colored("🔄 多时间框架协调器初始化完成", Colors.GREEN)
-
-    def analyze_timeframe_groups(self, symbol: str) -> Dict[str, str]:
-        """分析不同时间框架组的趋势
-
-        参数:
-            symbol: 交易对
-
-        返回:
-            包含短期和长期趋势的字典
-        """
-        # 获取趋势分析结果
-        timeframe_data = self.fetch_all_timeframes(symbol)
-        trend_analysis = self.analyze_timeframe_trends(symbol, timeframe_data)
-
-        # 定义时间框架组
-        short_term_frames = ["5m", "15m"]
-        long_term_frames = ["1h", "2h"]
-
-        # 统计各组的趋势
-        short_term_trends = {"UP": 0, "DOWN": 0, "NEUTRAL": 0}
-        long_term_trends = {"UP": 0, "DOWN": 0, "NEUTRAL": 0}
-
-        # 计算短期趋势
-        for tf in short_term_frames:
-            if tf in trend_analysis and trend_analysis[tf]["valid"]:
-                trend = trend_analysis[tf]["trend"]
-                short_term_trends[trend] += 1
-
-        # 计算长期趋势
-        for tf in long_term_frames:
-            if tf in trend_analysis and trend_analysis[tf]["valid"]:
-                trend = trend_analysis[tf]["trend"]
-                long_term_trends[trend] += 1
-
-        # 确定每组的主导趋势
-        short_term_dominant = max(short_term_trends.items(), key=lambda x: x[1])[0]
-        long_term_dominant = max(long_term_trends.items(), key=lambda x: x[1])[0]
-
-        # 处理平局情况
-        if short_term_trends["UP"] == short_term_trends["DOWN"]:
-            short_term_dominant = "NEUTRAL"
-        if long_term_trends["UP"] == long_term_trends["DOWN"]:
-            long_term_dominant = "NEUTRAL"
-
-        # 打印时间框架组结果
-        print_colored("===== 时间框架组分析 =====", Colors.BLUE)
-        print_colored(
-            f"短期趋势(5m,15m): {Colors.GREEN if short_term_dominant == 'UP' else Colors.RED if short_term_dominant == 'DOWN' else Colors.GRAY}{short_term_dominant}{Colors.RESET}",
-            Colors.INFO
-        )
-        print_colored(
-            f"长期趋势(1h,2h): {Colors.GREEN if long_term_dominant == 'UP' else Colors.RED if long_term_dominant == 'DOWN' else Colors.GRAY}{long_term_dominant}{Colors.RESET}",
-            Colors.INFO
-        )
-
-        return {
-            "short_term": short_term_dominant,
-            "long_term": long_term_dominant
-        }
 
     def fetch_all_timeframes(self, symbol: str, force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
         """获取指定交易对的所有时间框架数据
@@ -311,41 +257,15 @@ class MultiTimeframeCoordinator:
                         highest_contribution = contribution
                         dominant_tf = tf_name
 
-            # 修改趋势冲突检测部分
+            # 检测趋势冲突
             trend_conflicts = []
             if trend_counts["UP"] > 0 and trend_counts["DOWN"] > 0:
-                # 收集具体冲突，并分析时间框架组合
+                # 收集具体冲突
                 up_timeframes = [tf for tf, trend in valid_trends.items() if trend == "UP"]
                 down_timeframes = [tf for tf, trend in valid_trends.items() if trend == "DOWN"]
 
-                # 确定是否存在时间框架分组模式
-                short_term_frames = ["5m", "15m"]
-                long_term_frames = ["1h", "2h"]
-
-                # 检查短期vs长期趋势冲突
-                short_term_up = all(tf in up_timeframes for tf in short_term_frames if tf in valid_trends)
-                short_term_down = all(tf in down_timeframes for tf in short_term_frames if tf in valid_trends)
-                long_term_up = all(tf in up_timeframes for tf in long_term_frames if tf in valid_trends)
-                long_term_down = all(tf in down_timeframes for tf in long_term_frames if tf in valid_trends)
-
-                if short_term_up and long_term_down:
-                    conflict_description = f"短期上升({','.join(up_timeframes)}) vs 长期下降({','.join(down_timeframes)})"
-                    trend_conflicts.append(conflict_description)
-                    # 长期趋势更可靠，调整分数
-                    weighted_scores["DOWN"] += 0.5
-                    # 重新计算主导趋势
-                    dominant_trend = max(weighted_scores, key=weighted_scores.get)
-                elif short_term_down and long_term_up:
-                    conflict_description = f"短期下降({','.join(down_timeframes)}) vs 长期上升({','.join(up_timeframes)})"
-                    trend_conflicts.append(conflict_description)
-                    # 长期趋势更可靠，调整分数
-                    weighted_scores["UP"] += 0.5
-                    # 重新计算主导趋势
-                    dominant_trend = max(weighted_scores, key=weighted_scores.get)
-                else:
-                    # 混合冲突，没有明确的时间框架分组
-                    conflict_description = f"上升趋势({','.join(up_timeframes)}) vs 下降趋势({','.join(down_timeframes)})"
-                    trend_conflicts.append(conflict_description)
+                conflict_description = f"上升趋势({','.join(up_timeframes)}) vs 下降趋势({','.join(down_timeframes)})"
+                trend_conflicts.append(conflict_description)
 
             # 确定一致性级别
             if coherence_score >= 80 and trend_agreement >= 80:
@@ -364,10 +284,8 @@ class MultiTimeframeCoordinator:
                 recommendation = "BUY"
             elif dominant_trend == "DOWN" and agreement_level in ["高度一致", "较强一致"]:
                 recommendation = "SELL"
-            elif dominant_trend == "UP" and agreement_level == "中等一致":
-                recommendation = "LIGHT_UP"  # 轻度看涨
-            elif dominant_trend == "DOWN" and agreement_level == "中等一致":
-                recommendation = "LIGHT_DOWN"  # 轻度看跌
+            elif dominant_trend != "NEUTRAL" and agreement_level == "中等一致":
+                recommendation = f"LIGHT_{dominant_trend}"  # LIGHT_UP or LIGHT_DOWN
             else:
                 recommendation = "NEUTRAL"
 
@@ -619,122 +537,39 @@ class MultiTimeframeCoordinator:
         return new_score, adjustment_info
 
     def generate_signal(self, symbol: str, quality_score: float) -> Tuple[str, float, Dict[str, Any]]:
-        """
-        生成交易信号
+        """基于多时间框架分析生成信号
 
         参数:
             symbol: 交易对
             quality_score: 质量评分
 
         返回:
-            signal: 交易信号
-            adjusted_score: 调整后的质量评分
-            details: 详细信息
+            (信号, 调整后的质量评分, 详细信息)
         """
-        try:
-            # 获取一致性分析
-            coherence = self.get_timeframe_coherence(symbol)
+        # 获取一致性分析
+        coherence = self.get_timeframe_coherence(symbol)
 
-            # 调整质量评分
-            adjusted_score, adjustment_info = self.adjust_quality_score(symbol, quality_score)
+        # 调整质量评分
+        adjusted_score, adjustment_info = self.adjust_quality_score(symbol, quality_score)
 
-            # 根据一致性分析确定信号
-            if coherence["recommendation"] == "BUY" and adjusted_score >= 6.0:
-                signal = "BUY"
-            elif coherence["recommendation"] == "SELL" and adjusted_score <= 4.0:
-                signal = "SELL"
-            elif "LIGHT_UP" in coherence["recommendation"] and adjusted_score >= 5.5:
-                signal = "LIGHT_BUY"  # 轻度买入信号
-            elif "LIGHT_DOWN" in coherence["recommendation"] and adjusted_score <= 4.5:
-                signal = "LIGHT_SELL"  # 轻度卖出信号
-            else:
-                signal = "NEUTRAL"
+        # 确定信号
+        if coherence["recommendation"] == "BUY" and adjusted_score >= 6.0:
+            signal = "BUY"
+        elif coherence["recommendation"] == "SELL" and adjusted_score <= 4.0:
+            signal = "SELL"
+        elif "LIGHT_UP" in coherence["recommendation"] and adjusted_score >= 5.5:
+            signal = "LIGHT_BUY"  # 轻度买入信号
+        elif "LIGHT_DOWN" in coherence["recommendation"] and adjusted_score <= 4.5:
+            signal = "LIGHT_SELL"  # 轻度卖出信号
+        else:
+            signal = "NEUTRAL"
 
-            # 详细信息
-            details = {
-                "coherence": coherence,
-                "adjusted_score": adjusted_score,
-                "adjustment_info": adjustment_info,
-                "primary_timeframe": self.detect_primary_timeframe(symbol)
-            }
+        # 详细信息
+        details = {
+            "coherence": coherence,
+            "adjusted_score": adjusted_score,
+            "adjustment_info": adjustment_info,
+            "primary_timeframe": self.detect_primary_timeframe(symbol)
+        }
 
-            return signal, adjusted_score, details
-
-        except Exception as e:
-            print(f"生成信号错误: {e}")
-            # 返回默认值
-            return "NEUTRAL", quality_score, {"error": str(e)}
-
-    def predict_price_movement(self, symbol: str, timeframe_groups: Dict[str, str], coherence: Dict[str, Any]) -> Dict[
-        str, Any]:
-        """基于时间框架分析预测价格走势
-
-        参数:
-            symbol: 交易对
-            timeframe_groups: 时间框架组分析结果
-            coherence: 一致性分析结果
-
-        返回:
-            价格预测结果
-        """
-        try:
-            # 获取当前价格
-            ticker = self.client.futures_symbol_ticker(symbol=symbol)
-            current_price = float(ticker['price'])
-
-            # 获取趋势信息
-            short_term_trend = timeframe_groups.get("short_term", "NEUTRAL")
-            long_term_trend = timeframe_groups.get("long_term", "NEUTRAL")
-
-            # 获取一致性信息
-            dominant_trend = coherence.get("dominant_trend", "NEUTRAL")
-            agreement_level = coherence.get("agreement_level", "无")
-
-            # 预测方向和强度
-            direction = 0
-            strength = 0
-
-            # 确定预测方向
-            if short_term_trend == long_term_trend and short_term_trend != "NEUTRAL":
-                # 所有时间框架一致
-                direction = 1 if short_term_trend == "UP" else -1
-                strength = 0.8  # 高强度
-            elif dominant_trend != "NEUTRAL" and agreement_level in ["高度一致", "较强一致"]:
-                # 一致性分析有强信号
-                direction = 1 if dominant_trend == "UP" else -1
-                strength = 0.7  # 较高强度
-            elif short_term_trend != "NEUTRAL":
-                # 使用短期趋势
-                direction = 1 if short_term_trend == "UP" else -1
-                strength = 0.5  # 中等强度
-            elif long_term_trend != "NEUTRAL":
-                # 使用长期趋势
-                direction = 1 if long_term_trend == "UP" else -1
-                strength = 0.4  # 中低强度
-
-            # 根据强度计算预期变动百分比
-            base_movement = 0.03  # 基础变动3%
-            expected_movement = base_movement * strength
-
-            # 计算预期价格
-            predicted_price = current_price * (1 + direction * expected_movement)
-
-            # 返回预测结果
-            prediction = {
-                "current_price": current_price,
-                "predicted_price": predicted_price,
-                "direction": "UP" if direction > 0 else "DOWN" if direction < 0 else "NEUTRAL",
-                "expected_movement_pct": direction * expected_movement * 100,
-                "confidence": strength,
-                "valid": True
-            }
-
-            print_colored(f"价格预测: {current_price:.6f} -> {predicted_price:.6f} "
-                          f"({prediction['expected_movement_pct']:+.2f}%), 置信度: {strength:.2f}",
-                          Colors.GREEN if direction > 0 else Colors.RED if direction < 0 else Colors.GRAY)
-
-            return prediction
-        except Exception as e:
-            print_colored(f"价格预测失败: {e}", Colors.ERROR)
-            return {"valid": False, "error": str(e)}
-
+        return signal, adjusted_score, details

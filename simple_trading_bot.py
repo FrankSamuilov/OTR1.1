@@ -25,7 +25,7 @@ import datetime
 import time
 from integration_module import calculate_enhanced_indicators, generate_trade_recommendation
 from multi_timeframe_module import MultiTimeframeCoordinator
-from EntryWaitingManager import EntryWaitingManager
+
 # 导入集成模块（这是最简单的方法，因为它整合了所有其他模块的功能）
 from integration_module import (
     calculate_enhanced_indicators,
@@ -55,12 +55,12 @@ class EnhancedTradingBot:
         self.quality_score_history = {}  # 存储质量评分历史
         self.similar_patterns_history = {}  # 存储相似模式历史
         self.hedge_mode_enabled = True  # 默认启用双向持仓
-        self.dynamic_take_profit = 0.0175  # 默认2.5%止盈
-        self.dynamic_stop_loss = -0.0125  # 默认2.0%止损
+        self.dynamic_stop_loss = -0.008  # 默认初始止损0.8%
+        self.trailing_activation = 0.012  # 默认激活跟踪止损的阈值1.2%
+        self.trailing_base_distance = 0.003  # 默认跟踪距离0.3%
         self.market_bias = "neutral"  # 市场偏向：bullish/bearish/neutral
         self.trend_priority = False  # 是否优先考虑趋势明确的交易对
         self.strong_trend_symbols = []  # 趋势明确的交易对列表
-        self.entry_manager = EntryWaitingManager(self)
         # 多时间框架协调器初始化
         self.mtf_coordinator = MultiTimeframeCoordinator(self.client, self.logger)
         print("✅ 多时间框架协调器初始化完成")
@@ -127,8 +127,8 @@ class EnhancedTradingBot:
                 profit_pct = (entry_price - current_price) / entry_price
 
             # 使用持仓记录的个性化止盈止损设置，而不是全局默认值
-            take_profit = pos.get("dynamic_take_profit", 0.0175)  # 使用持仓特定的止盈值，默认2.5%
-            stop_loss = pos.get("stop_loss", -0.0125)  # 使用持仓特定的止损值，默认-1.75%
+            take_profit = pos.get("dynamic_take_profit", 0.025)  # 使用持仓特定的止盈值，默认2.5%
+            stop_loss = pos.get("stop_loss", -0.0175)  # 使用持仓特定的止损值，默认-1.75%
 
             profit_color = Colors.GREEN if profit_pct >= 0 else Colors.RED
             print(
@@ -242,7 +242,7 @@ class EnhancedTradingBot:
 
     def active_position_monitor(self, check_interval=15):
         """
-        主动监控持仓，确保及时执行止盈止损，支持动态止盈止损
+        主动监控持仓，使用改进的跟踪止损策略
         """
         print(f"🔄 启动主动持仓监控（每{check_interval}秒检查一次）")
 
@@ -264,6 +264,17 @@ class EnhancedTradingBot:
                     position_side = pos.get("position_side", "LONG")
                     entry_price = pos["entry_price"]
 
+                    # 获取跟踪止损参数
+                    initial_stop_loss = pos.get("initial_stop_loss", -0.0175)
+                    trailing_activation = pos.get("trailing_activation", 0.012)
+                    trailing_distance = pos.get("trailing_distance", 0.003)
+                    trailing_active = pos.get("trailing_active", False)
+                    highest_price = pos.get("highest_price", entry_price if position_side == "LONG" else 0)
+                    lowest_price = pos.get("lowest_price", entry_price if position_side == "SHORT" else float('inf'))
+                    current_stop_level = pos.get("current_stop_level", entry_price * (
+                                1 + initial_stop_loss) if position_side == "LONG" else entry_price * (
+                                1 - initial_stop_loss))
+
                     # 获取当前价格
                     try:
                         ticker = self.client.futures_symbol_ticker(symbol=symbol)
@@ -272,51 +283,104 @@ class EnhancedTradingBot:
                         print(f"⚠️ 获取{symbol}价格失败: {e}")
                         continue
 
-                    # 计算利润百分比
+                    # 检查和更新止损
                     if position_side == "LONG":
                         profit_pct = (current_price - entry_price) / entry_price
+
+                        # 更新最高价格和止损位
+                        if current_price > highest_price:
+                            pos["highest_price"] = current_price
+                            highest_price = current_price
+
+                            # 检查是否达到跟踪止损激活阈值
+                            if not trailing_active and profit_pct >= trailing_activation:
+                                pos["trailing_active"] = True
+                                trailing_active = True
+                                print_colored(
+                                    f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
+                                    Colors.GREEN)
+
+                            # 如果跟踪止损已激活，更新止损价格
+                            if trailing_active:
+                                new_stop_level = highest_price * (1 - trailing_distance)
+                                if new_stop_level > current_stop_level:
+                                    pos["current_stop_level"] = new_stop_level
+                                    current_stop_level = new_stop_level
+                                    print_colored(
+                                        f"🔄 主动监控: {symbol} {position_side} 上移止损位至 {current_stop_level:.6f}",
+                                        Colors.CYAN)
+
+                        # 检查是否触发止损
+                        if current_price <= current_stop_level:
+                            print_colored(
+                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损",
+                                Colors.YELLOW)
+                            success, closed = self.close_position(symbol, position_side)
+                            if success:
+                                print_colored(f"✅ {symbol} {position_side} 止损平仓成功: {profit_pct:.2%}",
+                                              Colors.GREEN)
+                                self.logger.info(f"{symbol} {position_side}主动监控止损平仓", extra={
+                                    "profit_pct": profit_pct,
+                                    "stop_type": "trailing" if trailing_active else "initial",
+                                    "entry_price": entry_price,
+                                    "exit_price": current_price,
+                                    "highest_price": highest_price
+                                })
+
                     else:  # SHORT
                         profit_pct = (entry_price - current_price) / entry_price
 
-                    # 使用持仓特定的止盈止损设置，而不是全局默认值
-                    take_profit = pos.get("dynamic_take_profit", 0.0175)  # 默认2.5%
-                    stop_loss = pos.get("stop_loss", -0.0125)  # 默认-1.75%
+                        # 更新最低价格和止损位
+                        if current_price < lowest_price or lowest_price == 0:
+                            pos["lowest_price"] = current_price
+                            lowest_price = current_price
 
-                    # 日志记录当前状态
-                    if check_interval % 60 == 0:  # 每分钟记录一次
-                        print(
-                            f"{symbol} {position_side}: 盈亏 {profit_pct:.2%}, 止盈 {take_profit:.2%}, 止损 {stop_loss:.2%}")
+                            # 检查是否达到跟踪止损激活阈值
+                            if not trailing_active and profit_pct >= trailing_activation:
+                                pos["trailing_active"] = True
+                                trailing_active = True
+                                print_colored(
+                                    f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
+                                    Colors.GREEN)
 
-                    # 检查止盈条件
-                    if profit_pct >= take_profit:
-                        print(
-                            f"🔔 主动监控: {symbol} {position_side} 达到止盈条件 ({profit_pct:.2%} >= {take_profit:.2%})")
-                        success, closed = self.close_position(symbol, position_side)
-                        if success:
-                            print(f"✅ {symbol} {position_side} 止盈平仓成功: +{profit_pct:.2%}")
-                            self.logger.info(f"{symbol} {position_side}主动监控止盈平仓", extra={
-                                "profit_pct": profit_pct,
-                                "take_profit": take_profit,
-                                "entry_price": entry_price,
-                                "exit_price": current_price
-                            })
+                            # 如果跟踪止损已激活，更新止损价格
+                            if trailing_active:
+                                new_stop_level = lowest_price * (1 + trailing_distance)
+                                if new_stop_level < current_stop_level or current_stop_level == 0:
+                                    pos["current_stop_level"] = new_stop_level
+                                    current_stop_level = new_stop_level
+                                    print_colored(
+                                        f"🔄 主动监控: {symbol} {position_side} 下移止损位至 {current_stop_level:.6f}",
+                                        Colors.CYAN)
 
-                    # 检查止损条件
-                    elif profit_pct <= stop_loss:
-                        print(
-                            f"🔔 主动监控: {symbol} {position_side} 达到止损条件 ({profit_pct:.2%} <= {stop_loss:.2%})")
-                        success, closed = self.close_position(symbol, position_side)
-                        if success:
-                            print(f"✅ {symbol} {position_side} 止损平仓成功: {profit_pct:.2%}")
-                            self.logger.info(f"{symbol} {position_side}主动监控止损平仓", extra={
-                                "profit_pct": profit_pct,
-                                "stop_loss": stop_loss,
-                                "entry_price": entry_price,
-                                "exit_price": current_price
-                            })
+                        # 检查是否触发止损
+                        if current_price >= current_stop_level and current_stop_level > 0:
+                            print_colored(
+                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损",
+                                Colors.YELLOW)
+                            success, closed = self.close_position(symbol, position_side)
+                            if success:
+                                print_colored(f"✅ {symbol} {position_side} 止损平仓成功: {profit_pct:.2%}",
+                                              Colors.GREEN)
+                                self.logger.info(f"{symbol} {position_side}主动监控止损平仓", extra={
+                                    "profit_pct": profit_pct,
+                                    "stop_type": "trailing" if trailing_active else "initial",
+                                    "entry_price": entry_price,
+                                    "exit_price": current_price,
+                                    "lowest_price": lowest_price
+                                })
+
+                    # 日志记录当前状态（每分钟一次）
+                    if check_interval % 60 == 0:
+                        print_colored(
+                            f"{symbol} {position_side}: 盈亏 {profit_pct:.2%}, " +
+                            f"{'跟踪' if trailing_active else '初始'}止损位 {current_stop_level:.6f}",
+                            Colors.INFO
+                        )
 
                 # 等待下一次检查
                 time.sleep(check_interval)
+
         except Exception as e:
             print(f"主动持仓监控发生错误: {e}")
             self.logger.error(f"主动持仓监控错误", extra={"error": str(e)})
@@ -422,9 +486,9 @@ class EnhancedTradingBot:
                         expected_movement = abs(predicted - current_price) / current_price * 100
 
                         # 如果预期变动小于2.5%，则跳过交易
-                        if expected_movement < 1.75:  # 将最小要求从2.5%降低到1.75%
+                        if expected_movement < 2.5:
                             print_colored(
-                                f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求(1.75%)，跳过交易",
+                                f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求(2.5%)，跳过交易",
                                 Colors.WARNING)
                             continue
 
@@ -564,11 +628,6 @@ class EnhancedTradingBot:
         """根据市场条件动态调整交易参数 - 改进版，增强健壮性"""
         print("\n===== 市场条件分析与参数适配 =====")
 
-        # 初始化默认值，确保变量始终被定义
-        avg_volatility = 1.0  # 默认波动性
-        avg_trend_strength = 20.0  # 默认趋势强度
-        market_bias = "neutral"  # 默认市场偏向
-
         # 分析当前市场波动性
         volatility_levels = {}
         trend_strengths = {}
@@ -579,58 +638,200 @@ class EnhancedTradingBot:
         # 尝试获取BTC数据
         btc_df = None
         try:
-            # 尝试获取BTC数据，但不依赖它
+            # 首先尝试使用get_btc_data方法
             btc_df = self.get_btc_data()
-            print("✅ 成功尝试获取BTC数据")
+
+            # 检查获取的数据是否有效
+            if btc_df is not None and 'close' in btc_df.columns and len(btc_df) > 20:
+                print("✅ 成功获取BTC数据")
+                btc_current = btc_df['close'].iloc[-1]
+                btc_prev = btc_df['close'].iloc[-13]  # 约1小时前
+                btc_price_change = (btc_current - btc_prev) / btc_prev * 100
+                print(f"📊 BTC 1小时变化率: {btc_price_change:.2f}%")
+            else:
+                print("⚠️ 获取的BTC数据无效或不完整")
+                btc_df = None
         except Exception as e:
-            print(f"⚠️ BTC数据获取失败，将使用默认市场情绪: {e}")
-            # 继续执行，使用默认值
+            print(f"⚠️ 获取BTC数据时出错: {e}")
+            btc_df = None
+
+        # 如果无法获取BTC数据，尝试使用ETH或其他替代方法
+        if btc_df is None:
+            print("🔄 尝试替代方法获取市场情绪...")
+
+            # 尝试方法1: 直接使用futures_symbol_ticker获取BTC当前价格
+            try:
+                ticker_now = self.client.futures_symbol_ticker(symbol="BTCUSDT")
+                current_price = float(ticker_now['price'])
+
+                # 获取历史价格（通过klines获取单个数据点）
+                klines = self.client.futures_klines(symbol="BTCUSDT", interval="1h", limit=2)
+                if klines and len(klines) >= 2:
+                    prev_price = float(klines[0][4])  # 1小时前的收盘价
+                    btc_price_change = (current_price - prev_price) / prev_price * 100
+                    print(f"📊 BTC 1小时变化率(替代方法): {btc_price_change:.2f}%")
+                else:
+                    print("⚠️ 无法获取BTC历史数据，无法计算价格变化")
+            except Exception as e:
+                print(f"⚠️ 替代方法获取BTC数据失败: {e}")
+
+            # 尝试方法2: 使用ETH数据
+            if btc_price_change is None:
+                try:
+                    eth_df = self.get_historical_data_with_cache("ETHUSDT", force_refresh=True)
+                    if eth_df is not None and 'close' in eth_df.columns and len(eth_df) > 20:
+                        eth_current = eth_df['close'].iloc[-1]
+                        eth_prev = eth_df['close'].iloc[-13]  # 约1小时前
+                        eth_price_change = (eth_current - eth_prev) / eth_prev * 100
+                        print(f"📊 ETH 1小时变化率: {eth_price_change:.2f}% (BTC数据不可用，使用ETH替代)")
+                        btc_price_change = eth_price_change  # 使用ETH的变化率代替BTC
+                    else:
+                        print(f"⚠️ ETH数据不可用，将使用其他指标分析市场情绪")
+                except Exception as e:
+                    print(f"⚠️ 获取ETH数据出错: {e}")
 
         # 分析各交易对的波动性和趋势强度
-        try:
-            for symbol in self.config["TRADE_PAIRS"]:
-                df = self.get_historical_data_with_cache(symbol, force_refresh=True)
-                if df is not None and 'close' in df.columns and len(df) > 20:
-                    # 计算波动性（当前ATR相对于历史的比率）
-                    if 'ATR' in df.columns:
-                        current_atr = df['ATR'].iloc[-1]
-                        avg_atr = df['ATR'].rolling(20).mean().iloc[-1]
-                        volatility_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
-                        volatility_levels[symbol] = volatility_ratio
+        for symbol in self.config["TRADE_PAIRS"]:
+            df = self.get_historical_data_with_cache(symbol, force_refresh=True)
+            if df is not None and 'close' in df.columns and len(df) > 20:
+                # 计算波动性（当前ATR相对于历史的比率）
+                if 'ATR' in df.columns:
+                    current_atr = df['ATR'].iloc[-1]
+                    avg_atr = df['ATR'].rolling(20).mean().iloc[-1]
+                    volatility_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+                    volatility_levels[symbol] = volatility_ratio
 
-                        # 检查趋势强度
-                        if 'ADX' in df.columns:
-                            adx = df['ADX'].iloc[-1]
-                            trend_strengths[symbol] = adx
-        except Exception as e:
-            print(f"⚠️ 分析波动性和趋势强度时出错: {e}")
+                    # 检查趋势强度
+                    if 'ADX' in df.columns:
+                        adx = df['ADX'].iloc[-1]
+                        trend_strengths[symbol] = adx
+
+                # 计算1小时价格变化，用于市场情绪计算
+                if len(df) >= 13:  # 确保有足够数据
+                    recent_change = (df['close'].iloc[-1] - df['close'].iloc[-13]) / df['close'].iloc[-13] * 100
+                    market_sentiment_score += recent_change
+                    sentiment_factors += 1
+                    print(f"📊 {symbol} 1小时变化率: {recent_change:.2f}%")
+
+        # 如果BTC/ETH数据可用，给予更高权重
+        if btc_price_change is not None:
+            market_sentiment_score += btc_price_change * 3  # BTC变化的权重是普通交易对的3倍
+            sentiment_factors += 3
+            print(f"赋予BTC变化率 {btc_price_change:.2f}% 三倍权重")
+
+        # 计算平均市场情绪分数
+        if sentiment_factors > 0:
+            avg_market_sentiment = market_sentiment_score / sentiment_factors
+            print(f"📊 平均市场情绪得分: {avg_market_sentiment:.2f}%")
+
+            # 根据得分确定市场情绪
+            if avg_market_sentiment > 1.5:
+                market_bias = "bullish"
+                print(f"📊 市场情绪: 看涨 ({avg_market_sentiment:.2f}%)")
+            elif avg_market_sentiment < -1.5:
+                market_bias = "bearish"
+                print(f"📊 市场情绪: 看跌 ({avg_market_sentiment:.2f}%)")
+            else:
+                market_bias = "neutral"
+                print(f"📊 市场情绪: 中性 ({avg_market_sentiment:.2f}%)")
+        else:
+            # 极少情况下，无法获取任何有效数据
+            market_bias = "neutral"
+            print(f"⚠️ 无法收集足够市场数据，默认中性情绪")
 
         # 计算整体市场波动性
         if volatility_levels:
             avg_volatility = sum(volatility_levels.values()) / len(volatility_levels)
             print(f"📈 平均市场波动性: {avg_volatility:.2f}x (1.0为正常水平)")
+
+            # 波动性高低排名
+            high_vol_pairs = sorted(volatility_levels.items(), key=lambda x: x[1], reverse=True)[:3]
+            low_vol_pairs = sorted(volatility_levels.items(), key=lambda x: x[1])[:3]
+
+            print("📊 高波动交易对:")
+            for sym, vol in high_vol_pairs:
+                print(f"  - {sym}: {vol:.2f}x")
+
+            print("📊 低波动交易对:")
+            for sym, vol in low_vol_pairs:
+                print(f"  - {sym}: {vol:.2f}x")
         else:
-            print(f"📈 使用默认市场波动性: {avg_volatility:.2f}x")
+            avg_volatility = 1.0  # 默认值
 
         # 计算整体趋势强度
         if trend_strengths:
             avg_trend_strength = sum(trend_strengths.values()) / len(trend_strengths)
             print(f"📏 平均趋势强度(ADX): {avg_trend_strength:.2f} (>25为强趋势)")
+
+            # 趋势强度排名
+            strong_trend_pairs = sorted(trend_strengths.items(), key=lambda x: x[1], reverse=True)[:3]
+            weak_trend_pairs = sorted(trend_strengths.items(), key=lambda x: x[1])[:3]
+
+            print("📊 强趋势交易对:")
+            for sym, adx in strong_trend_pairs:
+                print(f"  - {sym}: ADX {adx:.2f}")
         else:
-            print(f"📏 使用默认趋势强度(ADX): {avg_trend_strength:.2f}")
+            avg_trend_strength = 20.0  # 默认值
 
-        # 使用固定的止盈止损设置，不依赖市场条件
-        self.dynamic_take_profit = 0.0175  # 固定1.75%止盈
-        self.dynamic_stop_loss = -0.0125  # 固定1.25%止损
-        print(f"ℹ️ 使用固定止盈1.75%，止损1.25%")
+        # 根据市场条件调整交易参数
+        # 1. 波动性调整
+        if avg_volatility > 1.5:  # 市场波动性高于平均50%
+            # 高波动环境
+            self.dynamic_stop_loss = -0.020  # 加大止损到2.0%
+            self.trailing_activation = 0.015  # 提高激活阈值到1.5%
+            print(f"⚠️ 市场波动性较高，调整初始止损至2.0%，跟踪激活阈值至1.5%")
 
-        # 保留市场情绪代码，但使用默认值
+            # 记录调整
+            self.logger.info("市场波动性高，调整交易参数", extra={
+                "volatility": avg_volatility,
+                "take_profit": self.dynamic_take_profit,
+                "stop_loss": self.dynamic_stop_loss
+            })
+        elif avg_volatility < 0.7:  # 市场波动性低于平均30%
+            # 低波动环境
+            self.dynamic_take_profit = 0.020  # 降低止盈到2.0%
+            self.dynamic_stop_loss = -0.015  # 缩小止损到1.5%
+            print(f"ℹ️ 市场波动性较低，调整止盈至2.0%，止损至1.5%")
+
+            # 记录调整
+            self.logger.info("市场波动性低，调整交易参数", extra={
+                "volatility": avg_volatility,
+                "take_profit": self.dynamic_take_profit,
+                "stop_loss": self.dynamic_stop_loss
+            })
+        else:
+            # 正常波动环境，恢复默认值
+            self.dynamic_take_profit = 0.025  # 恢复默认2.5%
+            self.dynamic_stop_loss = -0.0175  # 恢复默认1.75%
+            print(f"ℹ️ 市场波动性正常，使用默认止盈止损")
+
+            # 记录使用默认值
+            self.logger.info("市场波动性正常，使用默认参数", extra={
+                "volatility": avg_volatility,
+                "take_profit": self.dynamic_take_profit,
+                "stop_loss": self.dynamic_stop_loss
+            })
+
+        # 2. 市场情绪调整
         self.market_bias = market_bias
-        print(f"📊 市场情绪: {market_bias} (暂时使用默认值)")
+
+        # 3. 趋势强度调整
+        if avg_trend_strength > 30:  # 强趋势市场
+            print(f"🔍 强趋势市场(ADX={avg_trend_strength:.2f})，优先选择趋势明确的交易对")
+            self.trend_priority = True
+
+            # 可以记录强趋势的交易对，优先考虑
+            self.strong_trend_symbols = [sym for sym, adx in trend_strengths.items() if adx > 25]
+            if self.strong_trend_symbols:
+                print(f"💡 趋势明确的优先交易对: {', '.join(self.strong_trend_symbols)}")
+        else:
+            print(f"🔍 弱趋势或震荡市场(ADX={avg_trend_strength:.2f})，关注支撑阻力")
+            self.trend_priority = False
+            self.strong_trend_symbols = []
 
         return {
-            "volatility": avg_volatility,  # 确保返回已定义的值
-            "trend_strength": avg_trend_strength,
+            "volatility": avg_volatility if 'avg_volatility' in locals() else 1.0,
+            "trend_strength": avg_trend_strength if 'avg_trend_strength' in locals() else 20.0,
             "btc_change": btc_price_change,
             "take_profit": self.dynamic_take_profit,
             "stop_loss": self.dynamic_stop_loss,
@@ -752,115 +953,54 @@ class EnhancedTradingBot:
             self.logger.error(f"获取{symbol}历史数据失败: {e}")
             return None
 
-    def predict_short_term_price(self, symbol, horizon_minutes=60, environment=None):
-        """考虑市场环境的价格预测"""
+    def predict_short_term_price(self, symbol, horizon_minutes=60):
+        """预测短期价格走势"""
         df = self.get_historical_data_with_cache(symbol)
         if df is None or df.empty or len(df) < 20:
+            self.logger.warning(f"{symbol}数据不足，无法预测价格")
             return None
 
         try:
             # 计算指标
             df = calculate_optimized_indicators(df)
+            if df is None or df.empty:
+                return None
 
-            # 如果未提供环境，则进行分类
-            if environment is None:
-                environment = classify_market_environment(df)
+            # 使用简单线性回归预测价格
+            window_length = min(self.config.get("PREDICTION_WINDOW", 60), len(df))
+            window = df['close'].tail(window_length)
+            smoothed = window.rolling(window=3, min_periods=1).mean().bfill()
 
-            # 根据环境调整预测方法
-            if environment in ["STRONG_TREND", "TREND"]:
-                # 趋势市场使用线性回归，更远的预测
-                multiplier = self.config.get("TREND_PREDICTION_MULTIPLIER", 25)  # 更大的乘数
+            x = np.arange(len(smoothed))
+            slope, intercept = np.polyfit(x, smoothed, 1)
 
-                window_length = min(self.config.get("PREDICTION_WINDOW", 60), len(df))
-                window = df['close'].tail(window_length)
-                smoothed = window.rolling(window=3, min_periods=1).mean().bfill()
+            current_price = smoothed.iloc[-1]
+            candles_needed = horizon_minutes / 15.0  # 假设15分钟K线
+            multiplier = self.config.get("PREDICTION_MULTIPLIER", 15)
 
-                x = np.arange(len(smoothed))
-                slope, intercept = np.polyfit(x, smoothed, 1)
-
-                current_price = smoothed.iloc[-1]
-                candles_needed = horizon_minutes / 15.0
-
-                predicted_price = current_price + slope * candles_needed * multiplier
-
-            elif environment == "RANGING":
-                # 震荡市场使用均值回归预测
-                mean_price = df['close'].tail(20).mean()
-                current_price = df['close'].iloc[-1]
-
-                # 均值回归: 向均值移动25%的距离
-                reversion_rate = 0.25
-                predicted_price = current_price + (mean_price - current_price) * reversion_rate
-
-            elif environment == "ACCUMULATION":
-                # 积累期，预测可能的突破方向
-                bb_width = ((df['BB_Upper'].iloc[-1] - df['BB_Lower'].iloc[-1]) /
-                            df['BB_Middle'].iloc[-1]) if all(x in df.columns for x in
-                                                             ['BB_Upper', 'BB_Lower', 'BB_Middle']) else 0.1
-
-                if bb_width < 0.03:  # 极窄带宽，可能即将突破
-                    # 检查量能变化预测突破方向
-                    vol_change = df['volume'].pct_change(5).iloc[-1]
-
-                    current_price = df['close'].iloc[-1]
-                    bb_middle = df['BB_Middle'].iloc[-1]
-
-                    if vol_change > 0.3:  # 成交量增加30%
-                        # 可能是突破信号，预测向上或向下突破
-                        if current_price > bb_middle:
-                            # 价格在中轨上方，预测上突破
-                            predicted_price = df['BB_Upper'].iloc[-1] * 1.05
-                        else:
-                            # 价格在中轨下方，预测下突破
-                            predicted_price = df['BB_Lower'].iloc[-1] * 0.95
-                    else:
-                        # 无明确突破迹象，预测小幅波动
-                        predicted_price = current_price * (1 + np.random.uniform(-0.01, 0.01))
-                else:
-                    # 常规积累期，预测区间内波动
-                    current_price = df['close'].iloc[-1]
-                    predicted_price = current_price * (1 + np.random.uniform(-0.02, 0.02))
-
-            else:  # WEAK_TREND或其他
-                # 使用默认预测方法但降低倍增因子
-                window_length = min(self.config.get("PREDICTION_WINDOW", 40), len(df))
-                window = df['close'].tail(window_length)
-                smoothed = window.rolling(window=3, min_periods=1).mean().bfill()
-
-                x = np.arange(len(smoothed))
-                slope, intercept = np.polyfit(x, smoothed, 1)
-
-                current_price = smoothed.iloc[-1]
-                candles_needed = horizon_minutes / 15.0
-                multiplier = self.config.get("PREDICTION_MULTIPLIER", 10)  # 默认倍增因子
-
-                predicted_price = current_price + slope * candles_needed * multiplier
+            predicted_price = current_price + slope * candles_needed * multiplier
 
             # 确保预测有意义
-            current_price = df['close'].iloc[-1]
+            if slope > 0 and predicted_price < current_price:
+                predicted_price = current_price * 1.01  # 至少上涨1%
+            elif slope < 0 and predicted_price > current_price:
+                predicted_price = current_price * 0.99  # 至少下跌1%
 
-            # 根据环境限制预测幅度
-            if environment == "RANGING":
-                # 震荡市场预测波动有限
-                max_change = 0.03  # 最大3%变化
-            elif environment == "ACCUMULATION":
-                # 积累期可能突破，允许更大变化
-                max_change = 0.08  # 最大8%变化
-            elif environment == "STRONG_TREND":
-                # 强趋势，允许更大幅度
-                max_change = 0.15  # 最大15%变化
-            else:
-                # 其他情况
-                max_change = 0.05  # 最大5%变化
+            # 限制在历史范围内
+            hist_max = window.max() * 1.05  # 允许5%的超出
+            hist_min = window.min() * 0.95  # 允许5%的超出
+            predicted_price = min(max(predicted_price, hist_min), hist_max)
 
-            # 限制在合理范围内
-            max_price = current_price * (1 + max_change)
-            min_price = current_price * (1 - max_change)
-            predicted_price = max(min(predicted_price, max_price), min_price)
+            self.logger.info(f"{symbol}价格预测: {predicted_price:.6f}", extra={
+                "current_price": current_price,
+                "predicted_price": predicted_price,
+                "horizon_minutes": horizon_minutes,
+                "slope": slope
+            })
 
             return predicted_price
         except Exception as e:
-            self.logger.error(f"{symbol} 价格预测失败: {e}")
+            self.logger.error(f"{symbol}价格预测失败: {e}")
             return None
 
     def manage_resources(self):
@@ -917,7 +1057,8 @@ class EnhancedTradingBot:
         print(f"⏱️ 机器人已运行: {run_hours:.2f}小时")
 
     def generate_trade_signal(self, df, symbol):
-        """生成考虑市场环境的交易信号"""
+        """生成更积极的交易信号，考虑市场偏向和趋势优先"""
+
         if df is None or len(df) < 20:
             return "HOLD", 0
 
@@ -927,336 +1068,101 @@ class EnhancedTradingBot:
             if df is None or df.empty:
                 return "HOLD", 0
 
-            # 1. 分类市场环境
-            environment = self.classify_market_environment(df)
-            print_colored(f"{symbol} 当前市场环境: {environment}", Colors.BLUE + Colors.BOLD)
+            # 计算质量评分
+            quality_score, metrics = calculate_quality_score(df, self.client, symbol, None, self.config, self.logger)
+            print_colored(f"{symbol} 初始质量评分: {quality_score:.2f}", Colors.INFO)
 
-            # 2. 根据环境选择适合的指标和权重
-            indicator_signals = {}
+            # 获取多时间框架信号
+            signal, adjusted_score, details = self.mtf_coordinator.generate_signal(symbol, quality_score)
+            print_colored(f"多时间框架信号: {signal}, 调整后评分: {adjusted_score:.2f}", Colors.INFO)
 
-            # ===== 震荡市场优先指标 =====
-            if environment == "RANGING" or environment == "ACCUMULATION":
-                # RSI信号(震荡市场的主要指标)
-                if 'RSI' in df.columns:
-                    rsi = df['RSI'].iloc[-1]
-                    if rsi < 30:
-                        indicator_signals["RSI"] = {"signal": "BUY", "strength": 0.8, "value": rsi}
-                        print_colored(f"RSI: {rsi:.2f} - 超卖区域，看涨信号", Colors.GREEN)
-                    elif rsi > 70:
-                        indicator_signals["RSI"] = {"signal": "SELL", "strength": 0.8, "value": rsi}
-                        print_colored(f"RSI: {rsi:.2f} - 超买区域，看跌信号", Colors.RED)
-                    else:
-                        indicator_signals["RSI"] = {"signal": "NEUTRAL", "strength": 0.3, "value": rsi}
-                        print_colored(f"RSI: {rsi:.2f} - 中性区域", Colors.GRAY)
+            # 打印一致性分析详情
+            coherence = details.get("coherence", {})
+            print_colored(f"{symbol} 一致性分析:", Colors.INFO)
+            print_colored(f"  一致性级别: {coherence.get('agreement_level', '未知')}", Colors.INFO)
+            print_colored(f"  主导趋势: {coherence.get('dominant_trend', '未知')}", Colors.INFO)
+            print_colored(f"  推荐: {coherence.get('recommendation', '未知')}", Colors.INFO)
 
-                # 布林带信号
-                if all(x in df.columns for x in ['BB_Upper', 'BB_Lower', 'BB_Middle']):
-                    close = df['close'].iloc[-1]
-                    upper = df['BB_Upper'].iloc[-1]
-                    lower = df['BB_Lower'].iloc[-1]
-                    middle = df['BB_Middle'].iloc[-1]
+            # 考虑市场偏向
+            if hasattr(self, 'market_bias') and self.market_bias != "neutral":
+                if self.market_bias == "bullish" and "SELL" not in signal:
+                    # 在看涨偏向下增强买入信号
+                    adjusted_score += 0.5
+                    print_colored(f"📈 市场看涨偏向，增强买入信号: +0.5分", Colors.GREEN)
+                elif self.market_bias == "bearish" and "BUY" not in signal:
+                    # 在看跌偏向下增强卖出信号
+                    adjusted_score -= 0.5
+                    print_colored(f"📉 市场看跌偏向，增强卖出信号: -0.5分", Colors.RED)
 
-                    bb_position = (close - lower) / (upper - lower)
+            # 考虑趋势优先
+            if hasattr(self, 'trend_priority') and self.trend_priority and hasattr(self, 'strong_trend_symbols'):
+                if symbol in self.strong_trend_symbols:
+                    trend_direction = coherence.get('dominant_trend', 'NEUTRAL')
+                    if trend_direction == "UP":
+                        adjusted_score += 0.7
+                        print_colored(f"⭐ {symbol}是强上升趋势交易对，提高买入评分: +0.7分", Colors.GREEN)
+                    elif trend_direction == "DOWN":
+                        adjusted_score -= 0.7
+                        print_colored(f"⭐ {symbol}是强下降趋势交易对，降低买入评分: -0.7分", Colors.RED)
 
-                    if close > upper * 0.98:
-                        if environment == "RANGING":
-                            indicator_signals["Bollinger"] = {"signal": "SELL", "strength": 0.7}
-                            print_colored(f"布林带: 价格接近上轨 ({bb_position:.2f})，震荡市场卖出信号", Colors.RED)
-                        elif environment == "ACCUMULATION":
-                            indicator_signals["Bollinger"] = {"signal": "BUY", "strength": 0.5}
-                            print_colored(f"布林带: 价格突破上轨 ({bb_position:.2f})，积累期潜在突破", Colors.GREEN)
-                    elif close < lower * 1.02:
-                        if environment == "RANGING":
-                            indicator_signals["Bollinger"] = {"signal": "BUY", "strength": 0.7}
-                            print_colored(f"布林带: 价格接近下轨 ({bb_position:.2f})，震荡市场买入信号", Colors.GREEN)
-                        elif environment == "ACCUMULATION":
-                            indicator_signals["Bollinger"] = {"signal": "SELL", "strength": 0.5}
-                            print_colored(f"布林带: 价格突破下轨 ({bb_position:.2f})，积累期潜在下破", Colors.RED)
-                    else:
-                        if bb_position > 0.8:
-                            indicator_signals["Bollinger"] = {"signal": "SELL", "strength": 0.4}
-                            print_colored(f"布林带: 价格位于上侧 ({bb_position:.2f})，偏向卖出", Colors.YELLOW)
-                        elif bb_position < 0.2:
-                            indicator_signals["Bollinger"] = {"signal": "BUY", "strength": 0.4}
-                            print_colored(f"布林带: 价格位于下侧 ({bb_position:.2f})，偏向买入", Colors.YELLOW)
-                        else:
-                            indicator_signals["Bollinger"] = {"signal": "NEUTRAL", "strength": 0.3}
-                            print_colored(f"布林带: 价格位于中间区域 ({bb_position:.2f})，中性信号", Colors.GRAY)
+            # 获取当前价格
+            try:
+                ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                current_price = float(ticker['price'])
+            except Exception as e:
+                return "HOLD", 0
 
-                # 威廉指标(R%)，震荡市场的反转指标
-                if 'Williams_R' in df.columns:
-                    williams = df['Williams_R'].iloc[-1]
+            # 获取价格预测
+            predicted_price = self.predict_short_term_price(symbol, horizon_minutes=60)
+            if predicted_price is None:
+                # 默认假设5%变动
+                predicted_price = current_price * (1.05 if signal == "BUY" else 0.95)
 
-                    if williams <= -80:
-                        indicator_signals["Williams_R"] = {"signal": "BUY", "strength": 0.7, "value": williams}
-                        print_colored(f"威廉指标: {williams:.2f} - 超卖区域，看涨信号", Colors.GREEN)
-                    elif williams >= -20:
-                        indicator_signals["Williams_R"] = {"signal": "SELL", "strength": 0.7, "value": williams}
-                        print_colored(f"威廉指标: {williams:.2f} - 超买区域，看跌信号", Colors.RED)
-                    else:
-                        indicator_signals["Williams_R"] = {"signal": "NEUTRAL", "strength": 0.3, "value": williams}
-                        print_colored(f"威廉指标: {williams:.2f} - 中性区域", Colors.GRAY)
+            # 计算预期变动
+            expected_movement = abs(predicted_price - current_price) / current_price * 100
+            print_colored(f"{symbol} 预期价格变动: {expected_movement:.2f}%", Colors.INFO)
 
-            # ===== 趋势市场优先指标 =====
-            if environment in ["STRONG_TREND", "TREND", "WEAK_TREND"]:
-                # 超级趋势(趋势市场的主要指标)
-                if 'Supertrend_Direction' in df.columns:
-                    st_direction = df['Supertrend_Direction'].iloc[-1]
+            # 降低最小预期变动要求 (从2.5%改为1.0%)
+            min_movement = 1.0
 
-                    if st_direction > 0:
-                        strength = 0.8 if environment == "STRONG_TREND" else 0.6
-                        indicator_signals["Supertrend"] = {"signal": "BUY", "strength": strength}
-                        print_colored(f"超级趋势: 上升趋势，看涨信号", Colors.GREEN)
-                    elif st_direction < 0:
-                        strength = 0.8 if environment == "STRONG_TREND" else 0.6
-                        indicator_signals["Supertrend"] = {"signal": "SELL", "strength": strength}
-                        print_colored(f"超级趋势: 下降趋势，看跌信号", Colors.RED)
+            # 只有当信号明确为"NEUTRAL"且预期变动很小时才保持观望
+            if signal == "NEUTRAL" and expected_movement < min_movement:
+                print_colored(f"{symbol} 无明确信号且预期变动({expected_movement:.2f}%)小于{min_movement}%",
+                              Colors.YELLOW)
+                return "HOLD", 0
 
-                # MACD(趋势跟踪指标)
-                if 'MACD' in df.columns and 'MACD_signal' in df.columns:
-                    macd = df['MACD'].iloc[-1]
-                    signal = df['MACD_signal'].iloc[-1]
-
-                    if macd > signal:
-                        strength = 0.7 if environment == "STRONG_TREND" else 0.5
-                        indicator_signals["MACD"] = {"signal": "BUY", "strength": strength}
-                        print_colored(f"MACD: {macd:.4f} > 信号线 {signal:.4f}，看涨信号", Colors.GREEN)
-                    elif macd < signal:
-                        strength = 0.7 if environment == "STRONG_TREND" else 0.5
-                        indicator_signals["MACD"] = {"signal": "SELL", "strength": strength}
-                        print_colored(f"MACD: {macd:.4f} < 信号线 {signal:.4f}，看跌信号", Colors.RED)
-                    else:
-                        indicator_signals["MACD"] = {"signal": "NEUTRAL", "strength": 0.3}
-                        print_colored(f"MACD: {macd:.4f} = 信号线 {signal:.4f}，中性信号", Colors.GRAY)
-
-                # Vortex指标(趋势确认)
-                if 'VI_plus' in df.columns and 'VI_minus' in df.columns:
-                    vi_plus = df['VI_plus'].iloc[-1]
-                    vi_minus = df['VI_minus'].iloc[-1]
-
-                    if vi_plus > vi_minus:
-                        strength = 0.6 if vi_plus - vi_minus > 0.05 else 0.4
-                        indicator_signals["Vortex"] = {"signal": "BUY", "strength": strength}
-                        print_colored(f"Vortex: VI+ {vi_plus:.4f} > VI- {vi_minus:.4f}，看涨信号", Colors.GREEN)
-                    elif vi_plus < vi_minus:
-                        strength = 0.6 if vi_minus - vi_plus > 0.05 else 0.4
-                        indicator_signals["Vortex"] = {"signal": "SELL", "strength": strength}
-                        print_colored(f"Vortex: VI+ {vi_plus:.4f} < VI- {vi_minus:.4f}，看跌信号", Colors.RED)
-                    else:
-                        indicator_signals["Vortex"] = {"signal": "NEUTRAL", "strength": 0.3}
-                        print_colored(f"Vortex: VI+ {vi_plus:.4f} = VI- {vi_minus:.4f}，中性信号", Colors.GRAY)
-
-            # ===== 每种环境都要检查的指标 =====
-
-            # 动量指标
-            if 'Momentum' in df.columns:
-                momentum = df['Momentum'].iloc[-1]
-
-                if momentum > 0:
-                    strength = 0.5 if environment in ["STRONG_TREND", "TREND"] else 0.3
-                    indicator_signals["Momentum"] = {"signal": "BUY", "strength": strength}
-                    print_colored(f"动量: {momentum:.2f} > 0，看涨信号", Colors.GREEN)
-                elif momentum < 0:
-                    strength = 0.5 if environment in ["STRONG_TREND", "TREND"] else 0.3
-                    indicator_signals["Momentum"] = {"signal": "SELL", "strength": strength}
-                    print_colored(f"动量: {momentum:.2f} < 0，看跌信号", Colors.RED)
-                else:
-                    indicator_signals["Momentum"] = {"signal": "NEUTRAL", "strength": 0.2}
-                    print_colored(f"动量: {momentum:.2f} = 0，中性信号", Colors.GRAY)
-
-            # 移动平均线指标
-            if 'EMA5' in df.columns and 'EMA20' in df.columns:
-                ema5 = df['EMA5'].iloc[-1]
-                ema20 = df['EMA20'].iloc[-1]
-
-                if ema5 > ema20:
-                    strength = 0.6 if environment in ["STRONG_TREND", "TREND"] else 0.4
-                    indicator_signals["EMA"] = {"signal": "BUY", "strength": strength}
-                    print_colored(f"EMA: 短期(5) {ema5:.2f} > 长期(20) {ema20:.2f}，看涨信号", Colors.GREEN)
-                elif ema5 < ema20:
-                    strength = 0.6 if environment in ["STRONG_TREND", "TREND"] else 0.4
-                    indicator_signals["EMA"] = {"signal": "SELL", "strength": strength}
-                    print_colored(f"EMA: 短期(5) {ema5:.2f} < 长期(20) {ema20:.2f}，看跌信号", Colors.RED)
-                else:
-                    indicator_signals["EMA"] = {"signal": "NEUTRAL", "strength": 0.2}
-                    print_colored(f"EMA: 短期(5) {ema5:.2f} = 长期(20) {ema20:.2f}，中性信号", Colors.GRAY)
-
-            # 3. 综合各指标信号
-            buy_strength = 0
-            sell_strength = 0
-            total_strength = 0
-
-            for indicator, data in indicator_signals.items():
-                if data["signal"] == "BUY":
-                    buy_strength += data["strength"]
-                elif data["signal"] == "SELL":
-                    sell_strength += data["strength"]
-                total_strength += data["strength"]
-
-            # 确保总强度不为零
-            if total_strength == 0:
-                total_strength = 1
-
-            # 归一化买卖信号强度
-            buy_ratio = buy_strength / total_strength
-            sell_ratio = sell_strength / total_strength
-
-            # 输出信号比例
-            print_colored(f"信号强度比例 - 买入: {buy_ratio:.2f}, 卖出: {sell_ratio:.2f}", Colors.BLUE)
-
-            # 4. 基于环境的不同阈值
-            if environment in ["STRONG_TREND", "TREND"]:
-                # 趋势市场需要更强的信号
-                buy_threshold = 0.65  # 需要65%的买入信号
-                sell_threshold = 0.65  # 需要65%的卖出信号
-            else:
-                # 震荡市场可以更积极
-                buy_threshold = 0.55  # 需要55%的买入信号
-                sell_threshold = 0.55  # 需要55%的卖出信号
-
-            # 5. 确定最终信号
-            if buy_ratio >= buy_threshold:
+            # 更积极的信号生成 - 降低质量评分阈值
+            if adjusted_score >= 5.0 and "BUY" in signal:
                 final_signal = "BUY"
-                # 质量评分模拟 - 基于信号强度(0-10分)
-                adjusted_score = 5.0 + (buy_ratio * 5.0)  # 分数范围5-10
-            elif sell_ratio >= sell_threshold:
+            elif adjusted_score <= 5.0 and "SELL" in signal:
                 final_signal = "SELL"
-                # 质量评分模拟 - 基于信号强度(0-10分)
-                adjusted_score = 5.0 - (sell_ratio * 5.0)  # 分数范围0-5
+            elif coherence.get("recommendation") == "BUY" and adjusted_score >= 4.5:
+                final_signal = "BUY"
+            elif coherence.get("recommendation") == "SELL" and adjusted_score <= 5.5:
+                final_signal = "SELL"
+            # 特殊处理黄金ETF
+            elif symbol == "PAXGUSDT":
+                if adjusted_score >= 5.0:
+                    final_signal = "BUY"
+                    print_colored(f"为 PAXGUSDT 生成特殊 BUY 信号", Colors.GREEN)
+                else:
+                    final_signal = "SELL"
+                    print_colored(f"为 PAXGUSDT 生成特殊 SELL 信号", Colors.RED)
             else:
                 final_signal = "HOLD"
-                # 中性评分
-                adjusted_score = 5.0
 
-            # 6. 记录最终信号
-            print_colored(f"{symbol} 环境感知信号: {final_signal}, 评分: {adjusted_score:.2f}", Colors.BOLD)
+            # 动态止盈止损考虑
+            if hasattr(self, 'dynamic_stop_loss'):
+                print_colored(
+                    f"{symbol} 当前使用跟踪止损策略，初始止损: {abs(self.dynamic_stop_loss) * 100:.2f}%, 激活阈值: 1.2%, 跟踪距离: 0.2-0.4%",
+                    Colors.CYAN)
 
+            print_colored(f"{symbol} 最终信号: {final_signal}, 评分: {adjusted_score:.2f}", Colors.INFO)
             return final_signal, adjusted_score
 
         except Exception as e:
             self.logger.error(f"{symbol} 信号生成失败: {e}")
             return "HOLD", 0
-
-    def diagnose_indicators(self, df, symbol):
-        """诊断各指标状态，帮助识别问题"""
-        print_colored(f"\n===== {symbol} 指标诊断 =====", Colors.BLUE + Colors.BOLD)
-
-        # 检查趋势指标
-        if 'ADX' in df.columns:
-            adx = df['ADX'].iloc[-1]
-            if adx > 30:
-                print_colored(f"ADX: {adx:.2f} - 强趋势", Colors.GREEN + Colors.BOLD)
-            elif adx > 20:
-                print_colored(f"ADX: {adx:.2f} - 弱趋势", Colors.GREEN)
-            else:
-                print_colored(f"ADX: {adx:.2f} - 无趋势/震荡", Colors.YELLOW)
-
-        # 检查超级趋势
-        if 'Supertrend_Direction' in df.columns:
-            st_dir = df['Supertrend_Direction'].iloc[-1]
-            if st_dir > 0:
-                print_colored("超级趋势: 上升趋势", Colors.GREEN)
-            elif st_dir < 0:
-                print_colored("超级趋势: 下降趋势", Colors.RED)
-            else:
-                print_colored("超级趋势: 中性", Colors.GRAY)
-
-        # 检查布林带
-        if all(x in df.columns for x in ['BB_Upper', 'BB_Lower', 'BB_Middle']):
-            close = df['close'].iloc[-1]
-            upper = df['BB_Upper'].iloc[-1]
-            lower = df['BB_Lower'].iloc[-1]
-            middle = df['BB_Middle'].iloc[-1]
-
-            bb_width = (upper - lower) / middle
-            position = (close - lower) / (upper - lower)
-
-            print_colored(f"布林带宽度: {bb_width:.4f}", Colors.BLUE)
-
-            if bb_width < 0.03:
-                print_colored("布林带极度收缩，可能即将突破", Colors.YELLOW + Colors.BOLD)
-            elif bb_width < 0.06:
-                print_colored("布林带收缩，波动性减小", Colors.YELLOW)
-
-            if position > 0.8:
-                print_colored(f"价格位置: 接近上轨 ({position:.2f})", Colors.RED)
-            elif position < 0.2:
-                print_colored(f"价格位置: 接近下轨 ({position:.2f})", Colors.GREEN)
-            else:
-                print_colored(f"价格位置: 中间区域 ({position:.2f})", Colors.GRAY)
-
-        # 检查RSI
-        if 'RSI' in df.columns:
-            rsi = df['RSI'].iloc[-1]
-            if rsi > 70:
-                print_colored(f"RSI: {rsi:.2f} - 超买", Colors.RED)
-            elif rsi < 30:
-                print_colored(f"RSI: {rsi:.2f} - 超卖", Colors.GREEN)
-            else:
-                print_colored(f"RSI: {rsi:.2f} - 中性", Colors.GRAY)
-
-        # 检查MACD
-        if 'MACD' in df.columns and 'MACD_signal' in df.columns:
-            macd = df['MACD'].iloc[-1]
-            signal = df['MACD_signal'].iloc[-1]
-            hist = df['MACD_histogram'].iloc[-1] if 'MACD_histogram' in df.columns else macd - signal
-
-            if macd > signal:
-                print_colored(f"MACD: {macd:.4f} > 信号线 {signal:.4f} (柱状图: {hist:.4f})", Colors.GREEN)
-            else:
-                print_colored(f"MACD: {macd:.4f} < 信号线 {signal:.4f} (柱状图: {hist:.4f})", Colors.RED)
-
-        # 检查Vortex
-        if 'VI_plus' in df.columns and 'VI_minus' in df.columns:
-            vi_plus = df['VI_plus'].iloc[-1]
-            vi_minus = df['VI_minus'].iloc[-1]
-            diff = vi_plus - vi_minus
-
-            if diff > 0:
-                print_colored(f"Vortex: VI+ {vi_plus:.4f} > VI- {vi_minus:.4f} (差值: {diff:.4f})", Colors.GREEN)
-            else:
-                print_colored(f"Vortex: VI+ {vi_plus:.4f} < VI- {vi_minus:.4f} (差值: {diff:.4f})", Colors.RED)
-
-        # 检查移动平均线
-        if 'EMA5' in df.columns and 'EMA20' in df.columns:
-            ema5 = df['EMA5'].iloc[-1]
-            ema20 = df['EMA20'].iloc[-1]
-
-            if ema5 > ema20:
-                print_colored(f"EMA交叉: 短期(5) {ema5:.2f} > 长期(20) {ema20:.2f}", Colors.GREEN)
-            else:
-                print_colored(f"EMA交叉: 短期(5) {ema5:.2f} < 长期(20) {ema20:.2f}", Colors.RED)
-
-    def classify_market_environment(self, df):
-        """
-        将市场分类为：强趋势、弱趋势、震荡、突破前的积累
-        """
-        # 获取ADX - 趋势强度指标
-        adx = df['ADX'].iloc[-1] if 'ADX' in df.columns else 0
-
-        # 获取布林带宽度
-        bbw = ((df['BB_Upper'].iloc[-1] - df['BB_Lower'].iloc[-1]) /
-               df['BB_Middle'].iloc[-1]) if all(x in df.columns for x in
-                                                ['BB_Upper', 'BB_Lower', 'BB_Middle']) else 0.1
-
-        # 计算波动率比率
-        atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else 0
-        atr_mean = df['ATR'].rolling(20).mean().iloc[-1] if 'ATR' in df.columns else 1
-        atr_ratio = atr / atr_mean if atr_mean > 0 else 1.0
-
-        # 市场环境分类
-        if adx > 30:
-            if atr_ratio > 1.5:
-                return "STRONG_TREND"  # 强趋势
-            else:
-                return "TREND"  # 普通趋势
-        elif adx < 20:
-            if bbw < 0.05:
-                return "ACCUMULATION"  # 积累期(可能的突破前兆)
-            else:
-                return "RANGING"  # 震荡市场
-        else:
-            return "WEAK_TREND"  # 弱趋势
 
     def place_hedge_orders(self, symbol, primary_side, quality_score):
         """根据质量评分和信号放置订单，支持双向持仓"""
@@ -1337,301 +1243,9 @@ class EnhancedTradingBot:
         else:
             return 2  # 默认低杠杆
 
-    def check_entry_timing(self, symbol: str, side: str) -> dict:
-        """
-        检查当前是否是好的入场时机，如果不是则提供预计入场价格和等待时间
-
-        参数:
-            symbol: 交易对符号
-            side: 交易方向 ('BUY' 或 'SELL')
-
-        返回:
-            dict: 包含入场决策和等待建议的字典
-            {
-                "should_enter": 是否应该立即入场(布尔值),
-                "expected_price": 预期入场价格,
-                "wait_minutes": 预计等待分钟数,
-                "reason": 决策理由,
-                "timing_quality": 入场时机质量评估
-            }
-        """
-        from logger_utils import Colors, print_colored
-        from pivot_points_module import calculate_pivot_points, analyze_pivot_point_strategy
-        from indicators_module import find_swing_points, calculate_fibonacci_retracements, get_smc_trend_and_duration
-
-        # 默认返回结果 - 允许入场
-        result = {
-            "should_enter": True,
-            "expected_price": 0.0,
-            "wait_minutes": 0,
-            "reason": "默认允许入场",
-            "timing_quality": "未知"
-        }
-
-        # 获取历史数据
-        df = self.get_historical_data_with_cache(symbol)
-        if df is None or df.empty or len(df) < 20:
-            return result  # 如果无法获取数据，默认允许入场
-
-        # 添加必要的技术指标
-        try:
-            # 确保数据中包含支点
-            if 'Classic_PP' not in df.columns:
-                df = calculate_pivot_points(df, method='classic')
-
-            # 获取支点分析
-            pivot_analysis = analyze_pivot_point_strategy(df, method='classic')
-
-            # 获取当前价格
-            ticker = self.client.futures_symbol_ticker(symbol=symbol)
-            current_price = float(ticker['price'])
-
-            # 获取摆动点
-            swing_highs, swing_lows = find_swing_points(df)
-
-            # 获取Fibonacci回撤水平
-            fib_levels = calculate_fibonacci_retracements(df)
-
-            # 获取趋势信息
-            trend, duration, trend_info = get_smc_trend_and_duration(df)
-
-            # 获取布林带信息
-            bb_upper = df['BB_Upper'].iloc[-1] if 'BB_Upper' in df.columns else None
-            bb_lower = df['BB_Lower'].iloc[-1] if 'BB_Lower' in df.columns else None
-            bb_middle = df['BB_Middle'].iloc[-1] if 'BB_Middle' in df.columns else None
-
-            # 获取ATR信息，用于评估波动性
-            atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else (df['high'].iloc[-1] - df['low'].iloc[-1]) * 0.1
-
-            # 根据ATR和当前价格计算预期等待时间(假设每分钟价格变动约为ATR的5%)
-            atr_per_minute = atr * 0.05
-
-            # 1. 检查买入入场条件
-            if side == "BUY":
-                # 获取关键支撑和阻力位
-                support_1 = pivot_analysis["support_1"]
-                resistance_1 = pivot_analysis["resistance_1"]
-                pivot_point = pivot_analysis["pivot_point"]
-
-                # 买入最佳入场条件:
-
-                # A. 价格已经突破阻力位 - 立即入场
-                if current_price > resistance_1 * 1.005:  # 突破阻力位R1达0.5%
-                    result["should_enter"] = True
-                    result["reason"] = f"价格 {current_price:.6f} 已突破阻力位 R1 {resistance_1:.6f}，确认上涨趋势"
-                    result["timing_quality"] = "优秀"
-                    return result
-
-                # B. 价格在支撑位附近 - 立即入场
-                if current_price < support_1 * 1.01:  # 在支撑位S1附近1%范围内
-                    result["should_enter"] = True
-                    result["reason"] = f"价格 {current_price:.6f} 接近支撑位 S1 {support_1:.6f}，可能反弹"
-                    result["timing_quality"] = "优秀"
-                    return result
-
-                # C. 布林带突破 - 立即入场
-                if bb_upper is not None and current_price > bb_upper * 1.002:
-                    result["should_enter"] = True
-                    result["reason"] = f"价格 {current_price:.6f} 突破布林带上轨 {bb_upper:.6f}，动能上升"
-                    result["timing_quality"] = "优秀"
-                    return result
-
-                # D. 趋势向上且回调到支撑位 - 立即入场
-                if trend == "UP" and current_price < bb_middle * 1.01 and current_price > bb_middle * 0.99:
-                    result["should_enter"] = True
-                    result["reason"] = f"价格回调至中轨附近 {bb_middle:.6f}，上升趋势中的回调买入"
-                    result["timing_quality"] = "良好"
-                    return result
-
-                # E. 特定Fibonacci回撤位 - 立即入场
-                if fib_levels and len(fib_levels) >= 3:
-                    fib_0382 = fib_levels[1]  # 0.382回撤位
-                    fib_0618 = fib_levels[2]  # 0.618回撤位
-
-                    if abs(current_price - fib_0618) / fib_0618 < 0.01:
-                        result["should_enter"] = True
-                        result["reason"] = f"价格 {current_price:.6f} 接近 0.618 Fibonacci回撤位 {fib_0618:.6f}"
-                        result["timing_quality"] = "良好"
-                        return result
-
-                    if abs(current_price - fib_0382) / fib_0382 < 0.01:
-                        result["should_enter"] = True
-                        result["reason"] = f"价格 {current_price:.6f} 接近 0.382 Fibonacci回撤位 {fib_0382:.6f}"
-                        result["timing_quality"] = "良好"
-                        return result
-
-                # F. 支点信号强烈建议买入 - 立即入场
-                if pivot_analysis["signal"] == "BUY" and pivot_analysis["confidence"] >= 0.7:
-                    result["should_enter"] = True
-                    result["reason"] = f"支点分析给出高置信度买入信号: {pivot_analysis['reason']}"
-                    result["timing_quality"] = "良好"
-                    return result
-
-                # 如果没有满足最佳入场条件，提供等待建议:
-
-                # 情况1: 价格高于阻力位下方 - 等待回调
-                if current_price > pivot_point and current_price < resistance_1 * 0.99:
-                    expected_price = resistance_1 * 1.01  # 期望价格突破阻力位1%
-                    price_diff = expected_price - current_price
-                    wait_minutes = max(10, abs(int(price_diff / atr_per_minute)))
-
-                    result["should_enter"] = False
-                    result["expected_price"] = expected_price
-                    result["wait_minutes"] = wait_minutes
-                    result["reason"] = f"价格接近阻力位，等待突破 R1 {resistance_1:.6f} 后入场"
-                    result["timing_quality"] = "一般"
-                    return result
-
-                # 情况2: 价格远离支撑位 - 等待回调到支撑位
-                if current_price > support_1 * 1.03:
-                    expected_price = support_1 * 1.01  # 期望价格靠近支撑位1%内
-                    price_diff = current_price - expected_price
-                    wait_minutes = max(15, abs(int(price_diff / atr_per_minute)))
-
-                    result["should_enter"] = False
-                    result["expected_price"] = expected_price
-                    result["wait_minutes"] = wait_minutes
-                    result["reason"] = f"价格远离支撑位，等待回调至 S1 {support_1:.6f} 附近后入场"
-                    result["timing_quality"] = "一般"
-                    return result
-
-                # 情况3: 价格远离中轨 - 等待回调到中轨
-                if bb_middle is not None and current_price > bb_middle * 1.02:
-                    expected_price = bb_middle
-                    price_diff = current_price - expected_price
-                    wait_minutes = max(12, abs(int(price_diff / atr_per_minute)))
-
-                    result["should_enter"] = False
-                    result["expected_price"] = expected_price
-                    result["wait_minutes"] = wait_minutes
-                    result["reason"] = f"价格高于中轨，等待回调至布林带中轨 {bb_middle:.6f} 后入场"
-                    result["timing_quality"] = "一般"
-                    return result
-
-                # 如果没有明确的等待条件，默认允许入场
-                result["timing_quality"] = "一般"
-                return result
-
-            # 2. 检查卖出入场条件
-            elif side == "SELL":
-                # 获取关键支撑和阻力位
-                support_1 = pivot_analysis["support_1"]
-                resistance_1 = pivot_analysis["resistance_1"]
-                pivot_point = pivot_analysis["pivot_point"]
-
-                # 卖出最佳入场条件:
-
-                # A. 价格已经跌破支撑位 - 立即入场
-                if current_price < support_1 * 0.995:  # 跌破支撑位S1达0.5%
-                    result["should_enter"] = True
-                    result["reason"] = f"价格 {current_price:.6f} 已跌破支撑位 S1 {support_1:.6f}，确认下跌趋势"
-                    result["timing_quality"] = "优秀"
-                    return result
-
-                # B. 价格在阻力位附近 - 立即入场
-                if current_price > resistance_1 * 0.99:  # 在阻力位R1附近1%范围内
-                    result["should_enter"] = True
-                    result["reason"] = f"价格 {current_price:.6f} 接近阻力位 R1 {resistance_1:.6f}，可能回落"
-                    result["timing_quality"] = "优秀"
-                    return result
-
-                # C. 布林带突破 - 立即入场
-                if bb_lower is not None and current_price < bb_lower * 0.998:
-                    result["should_enter"] = True
-                    result["reason"] = f"价格 {current_price:.6f} 跌破布林带下轨 {bb_lower:.6f}，动能下降"
-                    result["timing_quality"] = "优秀"
-                    return result
-
-                # D. 趋势向下且反弹到阻力位 - 立即入场
-                if trend == "DOWN" and current_price < bb_middle * 1.01 and current_price > bb_middle * 0.99:
-                    result["should_enter"] = True
-                    result["reason"] = f"价格反弹至中轨附近 {bb_middle:.6f}，下降趋势中的反弹卖出"
-                    result["timing_quality"] = "良好"
-                    return result
-
-                # E. 特定Fibonacci回撤位 - 立即入场
-                if fib_levels and len(fib_levels) >= 3:
-                    fib_0382 = fib_levels[1]  # 0.382回撤位
-                    fib_0618 = fib_levels[2]  # 0.618回撤位
-
-                    if abs(current_price - fib_0382) / fib_0382 < 0.01:
-                        result["should_enter"] = True
-                        result["reason"] = f"价格 {current_price:.6f} 接近 0.382 Fibonacci回撤位 {fib_0382:.6f}"
-                        result["timing_quality"] = "良好"
-                        return result
-
-                    if abs(current_price - fib_0618) / fib_0618 < 0.01:
-                        result["should_enter"] = True
-                        result["reason"] = f"价格 {current_price:.6f} 接近 0.618 Fibonacci回撤位 {fib_0618:.6f}"
-                        result["timing_quality"] = "良好"
-                        return result
-
-                # F. 支点信号强烈建议卖出 - 立即入场
-                if pivot_analysis["signal"] == "SELL" and pivot_analysis["confidence"] >= 0.7:
-                    result["should_enter"] = True
-                    result["reason"] = f"支点分析给出高置信度卖出信号: {pivot_analysis['reason']}"
-                    result["timing_quality"] = "良好"
-                    return result
-
-                # 如果没有满足最佳入场条件，提供等待建议:
-
-                # 情况1: 价格低于支撑位上方 - 等待跌破
-                if current_price < pivot_point and current_price > support_1 * 1.01:
-                    expected_price = support_1 * 0.99  # 期望价格跌破支撑位1%
-                    price_diff = current_price - expected_price
-                    wait_minutes = max(10, abs(int(price_diff / atr_per_minute)))
-
-                    result["should_enter"] = False
-                    result["expected_price"] = expected_price
-                    result["wait_minutes"] = wait_minutes
-                    result["reason"] = f"价格接近支撑位，等待跌破 S1 {support_1:.6f} 后入场"
-                    result["timing_quality"] = "一般"
-                    return result
-
-                # 情况2: 价格远离阻力位 - 等待反弹到阻力位
-                if current_price < resistance_1 * 0.97:
-                    expected_price = resistance_1 * 0.99  # 期望价格靠近阻力位1%内
-                    price_diff = expected_price - current_price
-                    wait_minutes = max(15, abs(int(price_diff / atr_per_minute)))
-
-                    result["should_enter"] = False
-                    result["expected_price"] = expected_price
-                    result["wait_minutes"] = wait_minutes
-                    result["reason"] = f"价格远离阻力位，等待反弹至 R1 {resistance_1:.6f} 附近后入场"
-                    result["timing_quality"] = "一般"
-                    return result
-
-                # 情况3: 价格远离中轨 - 等待反弹到中轨
-                if bb_middle is not None and current_price < bb_middle * 0.98:
-                    expected_price = bb_middle
-                    price_diff = expected_price - current_price
-                    wait_minutes = max(12, abs(int(price_diff / atr_per_minute)))
-
-                    result["should_enter"] = False
-                    result["expected_price"] = expected_price
-                    result["wait_minutes"] = wait_minutes
-                    result["reason"] = f"价格低于中轨，等待反弹至布林带中轨 {bb_middle:.6f} 后入场"
-                    result["timing_quality"] = "一般"
-                    return result
-
-                # 如果没有明确的等待条件，默认允许入场
-                result["timing_quality"] = "一般"
-                return result
-
-        except Exception as e:
-            # 如果计算过程出错，记录日志并默认允许入场
-            import traceback
-            error_details = traceback.format_exc()
-            print_colored(f"⚠️ 入场时机检查出错: {str(e)}", Colors.ERROR)
-            self.logger.error("入场时机检查出错", extra={"error": str(e), "traceback": error_details})
-            return result
-
-        # 如果执行到这里，表示没有匹配到任何入场条件，返回默认结果
-        return result
-
     def place_futures_order_usdc(self, symbol: str, side: str, amount: float, leverage: int = 5) -> bool:
         """
-        执行期货市场订单 - 使用固定止盈止损，不依赖市场预测
+        执行期货市场订单 - 改进版本，使用动态跟踪止损，无固定止盈
 
         参数:
             symbol: 交易对符号
@@ -1655,10 +1269,35 @@ class EnhancedTradingBot:
             ticker = self.client.futures_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
 
-            # 使用固定的止盈止损值，不依赖预测
-            take_profit = 0.0175  # 固定1.75%止盈
-            stop_loss = -0.0125  # 固定1.25%止损
-            print_colored(f"📊 使用固定止盈1.75%，止损1.25%", Colors.BLUE)
+            # 预测未来价格，用于检查最小价格变动和计算动态止损
+            predicted_price = self.predict_short_term_price(symbol, horizon_minutes=60)
+            if predicted_price is None:
+                predicted_price = current_price * (1.05 if side == "BUY" else 0.95)  # 默认5%变动
+
+            # 计算预期价格变动百分比
+            expected_movement = abs(predicted_price - current_price) / current_price * 100
+
+            # 修改为使用更低的预期变动阈值: 1.25%
+            if expected_movement < 1.25:
+                print_colored(f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求(1.25%)", Colors.WARNING)
+                self.logger.warning(f"{symbol}预期变动不足", extra={"expected_movement": expected_movement})
+                return False
+
+            # ==== 动态跟踪止损计算 ====
+            # 基础止损比例 - 根据波动率和预期方向调整
+            initial_stop_loss = -0.008  # 初始固定止损0.8%
+
+            # 启动跟踪止损的阈值
+            trailing_activation_threshold = 0.012  # 当价格向有利方向移动1.2%时激活跟踪止损
+
+            # 计算止损跟踪比例 - 根据上升空间预测调整
+            upside_potential = self.calculate_upside_potential(symbol, side, current_price)
+            if upside_potential > 0.05:  # 上升空间大于5%
+                trailing_distance = 0.004  # 更宽松的跟踪: 0.4%
+                print_colored(f"📈 {symbol}上升空间大({upside_potential:.2f}%)，设置宽松跟踪止损: 0.4%", Colors.GREEN)
+            else:
+                trailing_distance = 0.002  # 更紧密的跟踪: 0.2%
+                print_colored(f"📉 {symbol}上升空间有限({upside_potential:.2f}%)，设置紧密跟踪止损: 0.2%", Colors.YELLOW)
 
             # 严格限制订单金额不超过账户余额的5%
             max_allowed_amount = account_balance * 0.05
@@ -1692,7 +1331,7 @@ class EnhancedTradingBot:
                         # 最小订单价值
                         elif f['filterType'] == 'MIN_NOTIONAL':
                             notional_min = float(f.get('notional', 0))
-                    break
+                        break
 
             # 确保找到了必要的信息
             if step_size is None:
@@ -1732,6 +1371,8 @@ class EnhancedTradingBot:
             print_colored(f"🔢 {symbol} 计划交易: 金额={amount:.2f} USDC, 数量={quantity}, 价格={current_price}",
                           Colors.INFO)
             print_colored(f"🔢 杠杆: {leverage}倍, 实际保证金: {notional / leverage:.2f} USDC", Colors.INFO)
+            print_colored(f"📈 预期价格变动: {expected_movement:.2f}%, 从 {current_price:.6f} 到 {predicted_price:.6f}",
+                          Colors.INFO)
 
             # 设置杠杆
             try:
@@ -1768,14 +1409,22 @@ class EnhancedTradingBot:
                     "quantity": quantity,
                     "notional": notional,
                     "leverage": leverage,
-                    "take_profit": take_profit * 100,
-                    "stop_loss": abs(stop_loss) * 100
+                    "expected_movement": expected_movement,
+                    "initial_stop_loss": abs(initial_stop_loss) * 100,
+                    "trailing_activation": trailing_activation_threshold * 100,
+                    "trailing_distance": trailing_distance * 100
                 })
 
-                # 记录持仓信息 - 使用固定止盈止损
-                self.record_open_position(symbol, side, current_price, quantity,
-                                          take_profit=take_profit,
-                                          stop_loss=stop_loss)
+                # 记录持仓信息 - 新的跟踪止损系统
+                self.record_position_with_trailing_stop(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=current_price,
+                    quantity=quantity,
+                    initial_stop_loss=initial_stop_loss,  # 初始固定止损
+                    trailing_activation=trailing_activation_threshold,  # 激活跟踪的阈值
+                    trailing_distance=trailing_distance  # 跟踪距离
+                )
                 return True
 
             except Exception as e:
@@ -1801,7 +1450,444 @@ class EnhancedTradingBot:
             self.logger.error(f"{symbol} 交易错误", extra={"error": str(e)})
             return False
 
-    def record_open_position(self, symbol, side, entry_price, quantity, take_profit=0.0175, stop_loss=-0.0125):
+    def calculate_upside_potential(self, symbol, side, current_price):
+        """
+        计算价格上升空间，用于动态调整跟踪止损参数
+
+        参数:
+            symbol: 交易对符号
+            side: 交易方向 ('BUY' 或 'SELL')
+            current_price: 当前价格
+
+        返回:
+            upside_potential: 上升空间百分比 (0.0-1.0)
+        """
+        try:
+            # 获取历史数据
+            df = self.get_historical_data_with_cache(symbol)
+            if df is None or len(df) < 20:
+                return 0.03  # 默认上升空间3%
+
+            # 计算指标
+            df = calculate_optimized_indicators(df)
+            if df is None or df.empty:
+                return 0.03
+
+            # 1. 使用多时间框架信号
+            _, _, details = self.mtf_coordinator.generate_signal(symbol, 5.0)  # 使用中性评分
+            coherence = details.get("coherence", {})
+
+            # 一致性评分转换为上升空间
+            coherence_score = coherence.get("coherence_score", 50) / 100
+
+            # 根据一致性调整上升空间
+            if side == "BUY" and coherence.get("dominant_trend") == "UP":
+                coherence_factor = coherence_score * 0.03  # 最多贡献3%上升空间
+            elif side == "SELL" and coherence.get("dominant_trend") == "DOWN":
+                coherence_factor = coherence_score * 0.03
+            else:
+                coherence_factor = 0.01  # 无一致性时默认1%
+
+            # 2. 分析RSI指标
+            if 'RSI' in df.columns:
+                rsi = df['RSI'].iloc[-1]
+                if side == "BUY" and rsi < 40:  # 买入且RSI低（超卖）
+                    rsi_factor = 0.04  # 上升空间可能更大
+                elif side == "SELL" and rsi > 60:  # 卖出且RSI高（超买）
+                    rsi_factor = 0.04
+                else:
+                    rsi_factor = 0.02
+            else:
+                rsi_factor = 0.02
+
+            # 3. 分析价格相对布林带位置
+            if 'BB_Upper' in df.columns and 'BB_Lower' in df.columns and 'BB_Middle' in df.columns:
+                bb_position = (current_price - df['BB_Lower'].iloc[-1]) / (
+                            df['BB_Upper'].iloc[-1] - df['BB_Lower'].iloc[-1])
+
+                if side == "BUY" and bb_position < 0.3:  # 靠近下轨，上升空间大
+                    bb_factor = 0.05
+                elif side == "SELL" and bb_position > 0.7:  # 靠近上轨，下跌空间大
+                    bb_factor = 0.05
+                else:
+                    bb_factor = 0.02
+            else:
+                bb_factor = 0.02
+
+            # 综合计算上升空间
+            if side == "BUY":
+                upside_potential = (coherence_factor + rsi_factor + bb_factor) / 2
+            else:  # SELL - 下跌空间
+                upside_potential = (coherence_factor + rsi_factor + bb_factor) / 2
+
+            return min(upside_potential, 0.10)  # 限制在最大10%
+
+        except Exception as e:
+            self.logger.error(f"计算上升空间出错: {e}")
+            return 0.03  # 默认上升空间3%
+
+    def record_position_with_trailing_stop(self, symbol, side, entry_price, quantity,
+                                           initial_stop_loss, trailing_activation, trailing_distance):
+        """
+        记录新开的持仓，使用跟踪止损系统
+
+        参数:
+            symbol: 交易对符号
+            side: 交易方向 ('BUY' 或 'SELL')
+            entry_price: 入场价格
+            quantity: 交易数量
+            initial_stop_loss: 初始止损百分比 (如 -0.008 表示 -0.8%)
+            trailing_activation: 激活跟踪止损的价格变动阈值 (如 0.012 表示 1.2%)
+            trailing_distance: 跟踪止损距离 (如 0.003 表示 0.3%)
+        """
+        position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+
+        # 检查是否已有同方向持仓
+        for i, pos in enumerate(self.open_positions):
+            if pos["symbol"] == symbol and pos.get("position_side", None) == position_side:
+                # 合并持仓
+                total_qty = pos["quantity"] + quantity
+                new_entry = (pos["entry_price"] * pos["quantity"] + entry_price * quantity) / total_qty
+                self.open_positions[i]["entry_price"] = new_entry
+                self.open_positions[i]["quantity"] = total_qty
+                self.open_positions[i]["last_update_time"] = time.time()
+
+                # 更新止损设置
+                self.open_positions[i]["initial_stop_loss"] = initial_stop_loss
+                self.open_positions[i]["trailing_activation"] = trailing_activation
+                self.open_positions[i]["trailing_distance"] = trailing_distance
+                self.open_positions[i]["trailing_active"] = False
+                self.open_positions[i]["highest_price"] = new_entry if position_side == "LONG" else 0
+                self.open_positions[i]["lowest_price"] = new_entry if position_side == "SHORT" else float('inf')
+                self.open_positions[i]["current_stop_level"] = new_entry * (
+                            1 + initial_stop_loss) if position_side == "LONG" else new_entry * (1 - initial_stop_loss)
+
+                self.logger.info(f"更新{symbol} {position_side}持仓", extra={
+                    "new_entry_price": new_entry,
+                    "total_quantity": total_qty,
+                    "initial_stop_loss": initial_stop_loss,
+                    "trailing_activation": trailing_activation,
+                    "trailing_distance": trailing_distance
+                })
+                return
+
+        # 计算初始止损价格
+        initial_stop_price = entry_price * (1 + initial_stop_loss) if position_side == "LONG" else entry_price * (
+                    1 - initial_stop_loss)
+
+        # 添加新持仓，使用跟踪止损系统
+        new_pos = {
+            "symbol": symbol,
+            "side": side,
+            "position_side": position_side,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "open_time": time.time(),
+            "last_update_time": time.time(),
+            "max_profit": 0.0,
+            "initial_stop_loss": initial_stop_loss,
+            "trailing_activation": trailing_activation,
+            "trailing_distance": trailing_distance,
+            "trailing_active": False,
+            "highest_price": entry_price if position_side == "LONG" else 0,
+            "lowest_price": entry_price if position_side == "SHORT" else float('inf'),
+            "current_stop_level": initial_stop_price,
+            "position_id": f"{symbol}_{position_side}_{int(time.time())}"
+        }
+
+        self.open_positions.append(new_pos)
+        self.logger.info(f"新增{symbol} {position_side}持仓", extra={
+            **new_pos,
+            "initial_stop_price": initial_stop_price
+        })
+
+        print_colored(
+            f"📝 新增{symbol} {position_side}持仓，初始止损: {abs(initial_stop_loss) * 100:.2f}%，" +
+            f"跟踪激活阈值: {trailing_activation * 100:.2f}%，跟踪距离: {trailing_distance * 100:.2f}%",
+            Colors.GREEN + Colors.BOLD)
+
+    def manage_open_positions(self):
+        """管理现有持仓，使用改进的跟踪止损策略"""
+        self.load_existing_positions()
+
+        if not self.open_positions:
+            self.logger.info("当前无持仓")
+            return
+
+        current_time = time.time()
+        positions_to_remove = []  # 记录需要移除的持仓
+
+        for pos in self.open_positions:
+            symbol = pos["symbol"]
+            position_side = pos.get("position_side", "LONG")
+            entry_price = pos["entry_price"]
+
+            # 获取跟踪止损参数
+            initial_stop_loss = pos.get("initial_stop_loss", -0.0175)  # 默认-1.75%
+            trailing_activation = pos.get("trailing_activation", 0.012)  # 默认1.2%
+            trailing_distance = pos.get("trailing_distance", 0.003)  # 默认0.3%
+            trailing_active = pos.get("trailing_active", False)
+            highest_price = pos.get("highest_price", entry_price if position_side == "LONG" else 0)
+            lowest_price = pos.get("lowest_price", entry_price if position_side == "SHORT" else float('inf'))
+            current_stop_level = pos.get("current_stop_level", entry_price * (
+                        1 + initial_stop_loss) if position_side == "LONG" else entry_price * (1 - initial_stop_loss))
+
+            # 获取当前价格
+            try:
+                ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                current_price = float(ticker['price'])
+            except Exception as e:
+                print(f"⚠️ 无法获取 {symbol} 当前价格: {e}")
+                continue
+
+            # 计算盈亏百分比
+            if position_side == "LONG":
+                profit_pct = (current_price - entry_price) / entry_price
+
+                # 更新最高价格
+                if current_price > highest_price:
+                    highest_price = current_price
+                    pos["highest_price"] = highest_price
+
+                    # 检查是否达到跟踪止损激活阈值
+                    if not trailing_active and profit_pct >= trailing_activation:
+                        pos["trailing_active"] = True
+                        trailing_active = True
+                        print_colored(
+                            f"🔔 {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%} >= {trailing_activation:.2%})",
+                            Colors.GREEN)
+
+                    # 更新跟踪止损价格
+                    if trailing_active:
+                        new_stop_level = highest_price * (1 - trailing_distance)
+                        if new_stop_level > current_stop_level:
+                            current_stop_level = new_stop_level
+                            pos["current_stop_level"] = current_stop_level
+                            print_colored(
+                                f"🔄 {symbol} {position_side} 上移止损位至 {current_stop_level:.6f} (距离最高点 {trailing_distance * 100:.2f}%)",
+                                Colors.CYAN)
+
+                # 检查是否触发止损
+                if current_price <= current_stop_level:
+                    print_colored(
+                        f"🔔 {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损 ({current_price:.6f} <= {current_stop_level:.6f})",
+                        Colors.YELLOW)
+                    success, closed = self.close_position(symbol, position_side)
+                    if success:
+                        print_colored(f"✅ {symbol} {position_side} 止损平仓成功!", Colors.GREEN)
+                        positions_to_remove.append(pos)
+                        self.logger.info(f"{symbol} {position_side}止损平仓", extra={
+                            "profit_pct": profit_pct,
+                            "stop_type": "trailing" if trailing_active else "initial",
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "highest_price": highest_price
+                        })
+            else:  # SHORT
+                profit_pct = (entry_price - current_price) / entry_price
+
+                # 更新最低价格
+                if current_price < lowest_price or lowest_price == 0:
+                    lowest_price = current_price
+                    pos["lowest_price"] = lowest_price
+
+                    # 检查是否达到跟踪止损激活阈值
+                    if not trailing_active and profit_pct >= trailing_activation:
+                        pos["trailing_active"] = True
+                        trailing_active = True
+                        print_colored(
+                            f"🔔 {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%} >= {trailing_activation:.2%})",
+                            Colors.GREEN)
+
+                    # 更新跟踪止损价格
+                    if trailing_active:
+                        new_stop_level = lowest_price * (1 + trailing_distance)
+                        if new_stop_level < current_stop_level or current_stop_level == 0:
+                            current_stop_level = new_stop_level
+                            pos["current_stop_level"] = current_stop_level
+                            print_colored(
+                                f"🔄 {symbol} {position_side} 下移止损位至 {current_stop_level:.6f} (距离最低点 {trailing_distance * 100:.2f}%)",
+                                Colors.CYAN)
+
+                # 检查是否触发止损
+                if current_price >= current_stop_level and current_stop_level > 0:
+                    print_colored(
+                        f"🔔 {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损 ({current_price:.6f} >= {current_stop_level:.6f})",
+                        Colors.YELLOW)
+                    success, closed = self.close_position(symbol, position_side)
+                    if success:
+                        print_colored(f"✅ {symbol} {position_side} 止损平仓成功!", Colors.GREEN)
+                        positions_to_remove.append(pos)
+                        self.logger.info(f"{symbol} {position_side}止损平仓", extra={
+                            "profit_pct": profit_pct,
+                            "stop_type": "trailing" if trailing_active else "initial",
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "lowest_price": lowest_price
+                        })
+
+            # 打印持仓状态
+            profit_color = Colors.GREEN if profit_pct >= 0 else Colors.RED
+            print_colored(
+                f"{symbol} {position_side}: 当前盈亏 {profit_color}{profit_pct:.2%}{Colors.RESET}, " +
+                f"{'跟踪' if trailing_active else '初始'}止损位 {current_stop_level:.6f}",
+                Colors.INFO
+            )
+
+        # 从持仓列表中移除已平仓的持仓
+        for pos in positions_to_remove:
+            if pos in self.open_positions:
+                self.open_positions.remove(pos)
+
+        # 重新加载持仓以确保数据最新
+        self.load_existing_positions()
+
+    def active_position_monitor(self, check_interval=15):
+        """
+        主动监控持仓，使用改进的跟踪止损策略
+        """
+        print(f"🔄 启动主动持仓监控（每{check_interval}秒检查一次）")
+
+        try:
+            while True:
+                # 如果没有持仓，等待一段时间后再检查
+                if not self.open_positions:
+                    time.sleep(check_interval)
+                    continue
+
+                # 加载最新持仓
+                self.load_existing_positions()
+
+                # 当前持仓列表的副本，用于检查
+                positions = self.open_positions.copy()
+
+                for pos in positions:
+                    symbol = pos["symbol"]
+                    position_side = pos.get("position_side", "LONG")
+                    entry_price = pos["entry_price"]
+
+                    # 获取跟踪止损参数
+                    initial_stop_loss = pos.get("initial_stop_loss", -0.0175)
+                    trailing_activation = pos.get("trailing_activation", 0.012)
+                    trailing_distance = pos.get("trailing_distance", 0.003)
+                    trailing_active = pos.get("trailing_active", False)
+                    highest_price = pos.get("highest_price", entry_price if position_side == "LONG" else 0)
+                    lowest_price = pos.get("lowest_price", entry_price if position_side == "SHORT" else float('inf'))
+                    current_stop_level = pos.get("current_stop_level", entry_price * (
+                                1 + initial_stop_loss) if position_side == "LONG" else entry_price * (
+                                1 - initial_stop_loss))
+
+                    # 获取当前价格
+                    try:
+                        ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                        current_price = float(ticker['price'])
+                    except Exception as e:
+                        print(f"⚠️ 获取{symbol}价格失败: {e}")
+                        continue
+
+                    # 检查和更新止损
+                    if position_side == "LONG":
+                        profit_pct = (current_price - entry_price) / entry_price
+
+                        # 更新最高价格和止损位
+                        if current_price > highest_price:
+                            pos["highest_price"] = current_price
+                            highest_price = current_price
+
+                            # 检查是否达到跟踪止损激活阈值
+                            if not trailing_active and profit_pct >= trailing_activation:
+                                pos["trailing_active"] = True
+                                trailing_active = True
+                                print_colored(
+                                    f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
+                                    Colors.GREEN)
+
+                            # 如果跟踪止损已激活，更新止损价格
+                            if trailing_active:
+                                new_stop_level = highest_price * (1 - trailing_distance)
+                                if new_stop_level > current_stop_level:
+                                    pos["current_stop_level"] = new_stop_level
+                                    current_stop_level = new_stop_level
+                                    print_colored(
+                                        f"🔄 主动监控: {symbol} {position_side} 上移止损位至 {current_stop_level:.6f}",
+                                        Colors.CYAN)
+
+                        # 检查是否触发止损
+                        if current_price <= current_stop_level:
+                            print_colored(
+                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损",
+                                Colors.YELLOW)
+                            success, closed = self.close_position(symbol, position_side)
+                            if success:
+                                print_colored(f"✅ {symbol} {position_side} 止损平仓成功: {profit_pct:.2%}",
+                                              Colors.GREEN)
+                                self.logger.info(f"{symbol} {position_side}主动监控止损平仓", extra={
+                                    "profit_pct": profit_pct,
+                                    "stop_type": "trailing" if trailing_active else "initial",
+                                    "entry_price": entry_price,
+                                    "exit_price": current_price,
+                                    "highest_price": highest_price
+                                })
+
+                    else:  # SHORT
+                        profit_pct = (entry_price - current_price) / entry_price
+
+                        # 更新最低价格和止损位
+                        if current_price < lowest_price or lowest_price == 0:
+                            pos["lowest_price"] = current_price
+                            lowest_price = current_price
+
+                            # 检查是否达到跟踪止损激活阈值
+                            if not trailing_active and profit_pct >= trailing_activation:
+                                pos["trailing_active"] = True
+                                trailing_active = True
+                                print_colored(
+                                    f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
+                                    Colors.GREEN)
+
+                            # 如果跟踪止损已激活，更新止损价格
+                            if trailing_active:
+                                new_stop_level = lowest_price * (1 + trailing_distance)
+                                if new_stop_level < current_stop_level or current_stop_level == 0:
+                                    pos["current_stop_level"] = new_stop_level
+                                    current_stop_level = new_stop_level
+                                    print_colored(
+                                        f"🔄 主动监控: {symbol} {position_side} 下移止损位至 {current_stop_level:.6f}",
+                                        Colors.CYAN)
+
+                        # 检查是否触发止损
+                        if current_price >= current_stop_level and current_stop_level > 0:
+                            print_colored(
+                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损",
+                                Colors.YELLOW)
+                            success, closed = self.close_position(symbol, position_side)
+                            if success:
+                                print_colored(f"✅ {symbol} {position_side} 止损平仓成功: {profit_pct:.2%}",
+                                              Colors.GREEN)
+                                self.logger.info(f"{symbol} {position_side}主动监控止损平仓", extra={
+                                    "profit_pct": profit_pct,
+                                    "stop_type": "trailing" if trailing_active else "initial",
+                                    "entry_price": entry_price,
+                                    "exit_price": current_price,
+                                    "lowest_price": lowest_price
+                                })
+
+                    # 日志记录当前状态（每分钟一次）
+                    if check_interval % 60 == 0:
+                        print_colored(
+                            f"{symbol} {position_side}: 盈亏 {profit_pct:.2%}, " +
+                            f"{'跟踪' if trailing_active else '初始'}止损位 {current_stop_level:.6f}",
+                            Colors.INFO
+                        )
+
+                # 等待下一次检查
+                time.sleep(check_interval)
+
+        except Exception as e:
+            print(f"主动持仓监控发生错误: {e}")
+            self.logger.error(f"主动持仓监控错误", extra={"error": str(e)})
+
+    def record_open_position(self, symbol, side, entry_price, quantity, take_profit=0.025, stop_loss=-0.0175):
         """记录新开的持仓，使用固定的止盈止损比例
 
         参数:
@@ -1809,8 +1895,8 @@ class EnhancedTradingBot:
             side: 交易方向 ('BUY' 或 'SELL')
             entry_price: 入场价格
             quantity: 交易数量
-            take_profit: 止盈百分比，默认1.75%
-            stop_loss: 止损百分比，默认-1.25%
+            take_profit: 止盈百分比，默认2.5%
+            stop_loss: 止损百分比，默认-1.75%
         """
         position_side = "LONG" if side.upper() == "BUY" else "SHORT"
 
@@ -1966,26 +2052,52 @@ class EnhancedTradingBot:
             self.logger.error(f"平仓过程错误", extra={"symbol": symbol, "error": str(e)})
             return False, []
 
+    def convert_positions_to_trailing_stop(self):
+        """将现有持仓转换为使用跟踪止损策略"""
+        for pos in self.open_positions:
+            if "dynamic_take_profit" in pos or "stop_loss" in pos:
+                # 获取旧参数
+                old_take_profit = pos.get("dynamic_take_profit", 0.025)
+                old_stop_loss = pos.get("stop_loss", -0.0175)
 
+                # 设置新参数
+                pos["initial_stop_loss"] = old_stop_loss
+                pos["trailing_activation"] = 0.012  # 默认1.2%
+                pos["trailing_distance"] = 0.003  # 默认0.3%
+                pos["trailing_active"] = False
+                pos["highest_price"] = pos["entry_price"] if pos["position_side"] == "LONG" else 0
+                pos["lowest_price"] = pos["entry_price"] if pos["position_side"] == "SHORT" else float('inf')
+                pos["current_stop_level"] = pos["entry_price"] * (1 + old_stop_loss) if pos[
+                                                                                            "position_side"] == "LONG" else \
+                pos["entry_price"] * (1 - abs(old_stop_loss))
+
+                # 移除旧参数
+                if "dynamic_take_profit" in pos:
+                    del pos["dynamic_take_profit"]
+                if "stop_loss" in pos:
+                    del pos["stop_loss"]
+
+                print(f"已将 {pos['symbol']} {pos['position_side']} 转换为跟踪止损策略")
 
     def display_positions_status(self):
-        """显示所有持仓的状态"""
+        """显示所有持仓的状态，包括跟踪止损信息"""
         if not self.open_positions:
             print("当前无持仓")
             return
 
         print("\n==== 当前持仓状态 ====")
-        print(f"{'交易对':<10} {'方向':<6} {'持仓量':<10} {'开仓价':<10} {'当前价':<10} {'利润率':<8} {'持仓时间':<8}")
-        print("-" * 70)
+        print(
+            f"{'交易对':<10} {'方向':<6} {'持仓量':<10} {'开仓价':<10} {'当前价':<10} {'利润率':<8} {'持仓时间':<8} {'止损类型':<10} {'止损价':<10}")
+        print("-" * 100)
 
         current_time = time.time()
 
         for pos in self.open_positions:
             symbol = pos["symbol"]
-            position_side = pos["position_side"]
-            quantity = pos["quantity"]
-            entry_price = pos["entry_price"]
-            open_time = pos["open_time"]
+            position_side = pos.get("position_side", "LONG")
+            quantity = pos.get("quantity", 0)
+            entry_price = pos.get("entry_price", 0)
+            open_time = pos.get("open_time", current_time)
 
             # 获取当前价格
             try:
@@ -2003,10 +2115,20 @@ class EnhancedTradingBot:
             # 计算持仓时间
             holding_hours = (current_time - open_time) / 3600
 
-            print(
-                f"{symbol:<10} {position_side:<6} {quantity:<10.6f} {entry_price:<10.4f} {current_price:<10.4f} {profit_pct:<8.2f}% {holding_hours:<8.2f}h")
+            # 获取止损信息
+            trailing_active = pos.get("trailing_active", False)
+            current_stop_level = pos.get("current_stop_level", 0)
+            stop_type = "跟踪止损" if trailing_active else "初始止损"
 
-        print("-" * 70)
+            # 根据利润率设置颜色
+            profit_color = Colors.GREEN if profit_pct >= 0 else Colors.RED
+            profit_str = f"{profit_color}{profit_pct:.2f}%{Colors.RESET}"
+
+            print(
+                f"{symbol:<10} {position_side:<6} {quantity:<10.6f} {entry_price:<10.4f} {current_price:<10.4f} "
+                f"{profit_str:<15} {holding_hours:<8.2f}h {stop_type:<10} {current_stop_level:<10.6f}")
+
+        print("-" * 100)
 
     def get_btc_data(self):
         """专门获取BTC数据的方法"""
@@ -2102,19 +2224,19 @@ class EnhancedTradingBot:
             return False
 
     def display_position_sell_timing(self):
-        """显示持仓的预期卖出时机"""
+        """显示持仓的预期卖出时机，包括止损价格"""
         if not self.open_positions:
             return
 
         print("\n==== 持仓卖出预测 ====")
-        print(f"{'交易对':<10} {'方向':<6} {'当前价':<10} {'预测价':<10} {'预期收益':<10} {'预计时间':<8}")
+        print(f"{'交易对':<10} {'方向':<6} {'当前价':<10} {'预测价':<10} {'止损价':<10} {'预计时间':<8}")
         print("-" * 70)
 
         for pos in self.open_positions:
             symbol = pos["symbol"]
-            position_side = pos["position_side"]
-            entry_price = pos["entry_price"]
-            quantity = pos["quantity"]
+            position_side = pos.get("position_side", "LONG")
+            entry_price = pos.get("entry_price", 0)
+            quantity = pos.get("quantity", 0)
 
             # 获取当前价格
             try:
@@ -2128,11 +2250,9 @@ class EnhancedTradingBot:
             if predicted_price is None:
                 predicted_price = current_price
 
-            # 计算预期收益
-            if position_side == "LONG":
-                expected_profit = (predicted_price - entry_price) * quantity
-            else:  # SHORT
-                expected_profit = (entry_price - predicted_price) * quantity
+            # 获取止损信息
+            trailing_active = pos.get("trailing_active", False)
+            current_stop_level = pos.get("current_stop_level", 0)
 
             # 计算预计时间
             df = self.get_historical_data_with_cache(symbol)
@@ -2148,8 +2268,15 @@ class EnhancedTradingBot:
             else:
                 minutes_needed = 60
 
+            # 对非常大的时间进行限制
+            if minutes_needed > 1440:  # 超过24小时
+                minutes_str = ">24小时"
+            else:
+                minutes_str = f"{minutes_needed:.0f}分钟"
+
             print(
-                f"{symbol:<10} {position_side:<6} {current_price:<10.4f} {predicted_price:<10.4f} {expected_profit:<10.2f} {minutes_needed:<8.0f}分钟")
+                f"{symbol:<10} {position_side:<6} {current_price:<10.4f} {predicted_price:<10.4f} "
+                f"{current_stop_level:<10.4f} {minutes_str:<8}")
 
         print("-" * 70)
 
@@ -2563,17 +2690,18 @@ def check_all_positions_status(self):
                 profit_pct = (entry_price - current_price) / entry_price
 
             # 获取持仓特定的止盈止损设置
-            take_profit = pos.get("dynamic_take_profit", 0.0175)  # 默认2.5%
-            stop_loss = pos.get("stop_loss", -0.0125)  # 默认-1.75%
+            initial_stop_loss = pos.get("initial_stop_loss", -0.0175)  # 默认-1.75%
+            trailing_active = pos.get("trailing_active", False)
+            current_stop_level = pos.get("current_stop_level") # 默认-1.75%
 
             status = "正常"
             action_needed = False
 
-            if profit_pct >= take_profit:
-                status = f"⚠️ 已达到止盈条件 ({profit_pct:.2%} >= {take_profit:.2%})"
+            if position_side == "LONG" and current_price <= current_stop_level:
+                status = f"⚠️ 达到{'跟踪' if trailing_active else '初始'}止损条件 ({current_price:.6f} <= {current_stop_level:.6f})"
                 action_needed = True
-            elif profit_pct <= stop_loss:
-                status = f"⚠️ 已达到止损条件 ({profit_pct:.2%} <= {stop_loss:.2%})"
+            elif position_side == "SHORT" and current_price >= current_stop_level:
+                status = f"⚠️ 达到{'跟踪' if trailing_active else '初始'}止损条件 ({current_price:.6f} >= {current_stop_level:.6f})"
                 action_needed = True
 
             holding_time = (time.time() - pos["open_time"]) / 3600
