@@ -94,10 +94,8 @@ class EnhancedTradingBot:
 
         print(f"初始化完成，交易对: {self.config['TRADE_PAIRS']}")
 
-
-
     def manage_open_positions(self):
-        """管理现有持仓，使用每个持仓的特定止盈止损设置"""
+        """管理现有持仓，使用改进的跟踪止损策略"""
         self.load_existing_positions()
 
         if not self.open_positions:
@@ -112,6 +110,16 @@ class EnhancedTradingBot:
             position_side = pos.get("position_side", "LONG")
             entry_price = pos["entry_price"]
 
+            # 获取跟踪止损参数
+            initial_stop_loss = pos.get("initial_stop_loss", -0.0175)  # 默认-1.75%
+            trailing_activation = pos.get("trailing_activation", 0.012)  # 默认1.2%
+            trailing_distance = pos.get("trailing_distance", 0.003)  # 默认0.3%
+            trailing_active = pos.get("trailing_active", False)
+            highest_price = pos.get("highest_price", entry_price if position_side == "LONG" else 0)
+            lowest_price = pos.get("lowest_price", entry_price if position_side == "SHORT" else float('inf'))
+            current_stop_level = pos.get("current_stop_level", entry_price * (
+                        1 + initial_stop_loss) if position_side == "LONG" else entry_price * (1 - initial_stop_loss))
+
             # 获取当前价格
             try:
                 ticker = self.client.futures_symbol_ticker(symbol=symbol)
@@ -120,49 +128,94 @@ class EnhancedTradingBot:
                 print(f"⚠️ 无法获取 {symbol} 当前价格: {e}")
                 continue
 
-            # 计算盈亏百分比
+            # 根据持仓方向分别处理
             if position_side == "LONG":
                 profit_pct = (current_price - entry_price) / entry_price
+
+                # 1. 先检查是否需要激活跟踪止损（与价格创新高无关）
+                if not trailing_active and profit_pct >= trailing_activation:
+                    pos["trailing_active"] = True
+                    trailing_active = True
+                    print_colored(f"🔔 {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})", Colors.GREEN)
+
+                # 2. 检查是否创新高，需要更新止损位
+                if current_price > highest_price:
+                    pos["highest_price"] = current_price
+                    highest_price = current_price
+
+                    # 只有在跟踪止损已激活的情况下才更新止损位
+                    if trailing_active:
+                        new_stop_level = highest_price * (1 - trailing_distance)
+                        if new_stop_level > current_stop_level:  # 确保止损位只上移不下移
+                            pos["current_stop_level"] = new_stop_level
+                            current_stop_level = new_stop_level
+                            print_colored(f"🔄 {symbol} {position_side} 上移止损位至 {current_stop_level:.6f}",
+                                          Colors.CYAN)
+
+                # 3. 检查是否触发止损
+                if current_price <= current_stop_level:
+                    print_colored(
+                        f"🔔 {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损 (价格: {current_price:.6f} <= 止损: {current_stop_level:.6f})",
+                        Colors.YELLOW)
+                    success, closed = self.close_position(symbol, position_side)
+                    if success:
+                        print_colored(f"✅ {symbol} {position_side} 止损平仓成功!", Colors.GREEN)
+                        positions_to_remove.append(pos)
+                        self.logger.info(f"{symbol} {position_side}止损平仓", extra={
+                            "profit_pct": profit_pct,
+                            "stop_type": "trailing" if trailing_active else "initial",
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "highest_price": highest_price
+                        })
+
             else:  # SHORT
                 profit_pct = (entry_price - current_price) / entry_price
 
-            # 使用持仓记录的个性化止盈止损设置，而不是全局默认值
-            take_profit = pos.get("dynamic_take_profit", 0.025)  # 使用持仓特定的止盈值，默认2.5%
-            stop_loss = pos.get("stop_loss", -0.0175)  # 使用持仓特定的止损值，默认-1.75%
+                # 1. 先检查是否需要激活跟踪止损（与价格创新低无关）
+                if not trailing_active and profit_pct >= trailing_activation:
+                    pos["trailing_active"] = True
+                    trailing_active = True
+                    print_colored(f"🔔 {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})", Colors.GREEN)
 
+                # 2. 检查是否创新低，需要更新止损位
+                if current_price < lowest_price or lowest_price == 0:
+                    pos["lowest_price"] = current_price
+                    lowest_price = current_price
+
+                    # 只有在跟踪止损已激活的情况下才更新止损位
+                    if trailing_active:
+                        new_stop_level = lowest_price * (1 + trailing_distance)
+                        if new_stop_level < current_stop_level or current_stop_level == 0:  # 确保止损位只下移不上移
+                            pos["current_stop_level"] = new_stop_level
+                            current_stop_level = new_stop_level
+                            print_colored(f"🔄 {symbol} {position_side} 下移止损位至 {current_stop_level:.6f}",
+                                          Colors.CYAN)
+
+                # 3. 检查是否触发止损
+                if current_price >= current_stop_level and current_stop_level > 0:
+                    print_colored(
+                        f"🔔 {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损 (价格: {current_price:.6f} >= 止损: {current_stop_level:.6f})",
+                        Colors.YELLOW)
+                    success, closed = self.close_position(symbol, position_side)
+                    if success:
+                        print_colored(f"✅ {symbol} {position_side} 止损平仓成功!", Colors.GREEN)
+                        positions_to_remove.append(pos)
+                        self.logger.info(f"{symbol} {position_side}止损平仓", extra={
+                            "profit_pct": profit_pct,
+                            "stop_type": "trailing" if trailing_active else "initial",
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "lowest_price": lowest_price
+                        })
+
+            # 打印持仓状态
             profit_color = Colors.GREEN if profit_pct >= 0 else Colors.RED
-            print(
-                f"{symbol} {position_side}: 当前盈亏 {profit_color}{profit_pct:.2%}{Colors.RESET}, "
-                f"止盈线 {take_profit:.2%}, 止损线 {stop_loss:.2%}"
+            print_colored(
+                f"{symbol} {position_side}: 当前盈亏 {profit_color}{profit_pct:.2%}{Colors.RESET}, " +
+                f"{'跟踪' if trailing_active else '初始'}止损位 {current_stop_level:.6f}",
+                Colors.INFO
             )
-
-            # 检查是否达到止盈条件
-            if profit_pct >= take_profit:
-                print(f"🔔 {symbol} {position_side} 达到止盈条件 ({profit_pct:.2%} >= {take_profit:.2%})，执行平仓...")
-                success, closed = self.close_position(symbol, position_side)
-                if success:
-                    print(f"✅ {symbol} {position_side} 止盈平仓成功!")
-                    positions_to_remove.append(pos)
-                    self.logger.info(f"{symbol} {position_side}止盈平仓", extra={
-                        "profit_pct": profit_pct,
-                        "take_profit": take_profit,
-                        "entry_price": entry_price,
-                        "exit_price": current_price
-                    })
-
-            # 检查是否达到止损条件
-            elif profit_pct <= stop_loss:
-                print(f"🔔 {symbol} {position_side} 达到止损条件 ({profit_pct:.2%} <= {stop_loss:.2%})，执行平仓...")
-                success, closed = self.close_position(symbol, position_side)
-                if success:
-                    print(f"✅ {symbol} {position_side} 止损平仓成功!")
-                    positions_to_remove.append(pos)
-                    self.logger.info(f"{symbol} {position_side}止损平仓", extra={
-                        "profit_pct": profit_pct,
-                        "stop_loss": stop_loss,
-                        "entry_price": entry_price,
-                        "exit_price": current_price
-                    })
 
         # 从持仓列表中移除已平仓的持仓
         for pos in positions_to_remove:
@@ -283,37 +336,36 @@ class EnhancedTradingBot:
                         print(f"⚠️ 获取{symbol}价格失败: {e}")
                         continue
 
-                    # 检查和更新止损
+                    # 根据持仓方向分别处理
                     if position_side == "LONG":
                         profit_pct = (current_price - entry_price) / entry_price
 
-                        # 更新最高价格和止损位
+                        # 1. 先检查是否需要激活跟踪止损（与价格创新高无关）
+                        if not trailing_active and profit_pct >= trailing_activation:
+                            pos["trailing_active"] = True
+                            trailing_active = True
+                            print_colored(f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
+                                          Colors.GREEN)
+
+                        # 2. 检查是否创新高，需要更新止损位
                         if current_price > highest_price:
                             pos["highest_price"] = current_price
                             highest_price = current_price
 
-                            # 检查是否达到跟踪止损激活阈值
-                            if not trailing_active and profit_pct >= trailing_activation:
-                                pos["trailing_active"] = True
-                                trailing_active = True
-                                print_colored(
-                                    f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
-                                    Colors.GREEN)
-
-                            # 如果跟踪止损已激活，更新止损价格
+                            # 只有在跟踪止损已激活的情况下才更新止损位
                             if trailing_active:
                                 new_stop_level = highest_price * (1 - trailing_distance)
-                                if new_stop_level > current_stop_level:
+                                if new_stop_level > current_stop_level:  # 确保止损位只上移不下移
                                     pos["current_stop_level"] = new_stop_level
                                     current_stop_level = new_stop_level
                                     print_colored(
                                         f"🔄 主动监控: {symbol} {position_side} 上移止损位至 {current_stop_level:.6f}",
                                         Colors.CYAN)
 
-                        # 检查是否触发止损
+                        # 3. 检查是否触发止损
                         if current_price <= current_stop_level:
                             print_colored(
-                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损",
+                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损 (价格: {current_price:.6f} <= 止损: {current_stop_level:.6f})",
                                 Colors.YELLOW)
                             success, closed = self.close_position(symbol, position_side)
                             if success:
@@ -330,33 +382,32 @@ class EnhancedTradingBot:
                     else:  # SHORT
                         profit_pct = (entry_price - current_price) / entry_price
 
-                        # 更新最低价格和止损位
+                        # 1. 先检查是否需要激活跟踪止损（与价格创新低无关）
+                        if not trailing_active and profit_pct >= trailing_activation:
+                            pos["trailing_active"] = True
+                            trailing_active = True
+                            print_colored(f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
+                                          Colors.GREEN)
+
+                        # 2. 检查是否创新低，需要更新止损位
                         if current_price < lowest_price or lowest_price == 0:
                             pos["lowest_price"] = current_price
                             lowest_price = current_price
 
-                            # 检查是否达到跟踪止损激活阈值
-                            if not trailing_active and profit_pct >= trailing_activation:
-                                pos["trailing_active"] = True
-                                trailing_active = True
-                                print_colored(
-                                    f"🔔 主动监控: {symbol} {position_side} 激活跟踪止损 (利润: {profit_pct:.2%})",
-                                    Colors.GREEN)
-
-                            # 如果跟踪止损已激活，更新止损价格
+                            # 只有在跟踪止损已激活的情况下才更新止损位
                             if trailing_active:
                                 new_stop_level = lowest_price * (1 + trailing_distance)
-                                if new_stop_level < current_stop_level or current_stop_level == 0:
+                                if new_stop_level < current_stop_level or current_stop_level == 0:  # 确保止损位只下移不上移
                                     pos["current_stop_level"] = new_stop_level
                                     current_stop_level = new_stop_level
                                     print_colored(
                                         f"🔄 主动监控: {symbol} {position_side} 下移止损位至 {current_stop_level:.6f}",
                                         Colors.CYAN)
 
-                        # 检查是否触发止损
+                        # 3. 检查是否触发止损
                         if current_price >= current_stop_level and current_stop_level > 0:
                             print_colored(
-                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损",
+                                f"🔔 主动监控: {symbol} {position_side} 触发{'跟踪' if trailing_active else '初始'}止损 (价格: {current_price:.6f} >= 止损: {current_stop_level:.6f})",
                                 Colors.YELLOW)
                             success, closed = self.close_position(symbol, position_side)
                             if success:
@@ -370,11 +421,13 @@ class EnhancedTradingBot:
                                     "lowest_price": lowest_price
                                 })
 
-                    # 日志记录当前状态（每分钟一次）
+                    # 定期状态日志 (每分钟一次)
                     if check_interval % 60 == 0:
+                        profit_color = Colors.GREEN if profit_pct >= 0 else Colors.RED
+                        stop_type = "跟踪" if trailing_active else "初始"
                         print_colored(
-                            f"{symbol} {position_side}: 盈亏 {profit_pct:.2%}, " +
-                            f"{'跟踪' if trailing_active else '初始'}止损位 {current_stop_level:.6f}",
+                            f"{symbol} {position_side}: 盈亏 {profit_color}{profit_pct:.2%}{Colors.RESET}, "
+                            f"{stop_type}止损位 {current_stop_level:.6f}",
                             Colors.INFO
                         )
 
@@ -385,229 +438,7 @@ class EnhancedTradingBot:
             print(f"主动持仓监控发生错误: {e}")
             self.logger.error(f"主动持仓监控错误", extra={"error": str(e)})
 
-    def trade(self):
-        """增强版多时框架集成交易循环，包含主动持仓监控"""
-        import threading
 
-        print("启动增强版多时间框架集成交易机器人...")
-        self.logger.info("增强版多时间框架集成交易机器人启动", extra={"version": "Enhanced-MTF-" + VERSION})
-
-        # 在单独的线程中启动主动持仓监控
-        monitor_thread = threading.Thread(target=self.active_position_monitor, args=(15,), daemon=True)
-        monitor_thread.start()
-        print("✅ 主动持仓监控已在后台启动（每15秒检查一次）")
-
-        # 初始化API连接
-        self.check_and_reconnect_api()
-
-        while True:
-            try:
-                self.trade_cycle += 1
-                print(f"\n======== 交易循环 #{self.trade_cycle} ========")
-                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"当前时间: {current_time}")
-
-                # 每10个周期运行资源管理和API检查
-                if self.trade_cycle % 10 == 0:
-                    self.manage_resources()
-                    self.check_and_reconnect_api()
-
-                # 每5个周期分析一次市场条件
-                if self.trade_cycle % 5 == 0:
-                    print("\n----- 分析市场条件 -----")
-                    market_conditions = self.adapt_to_market_conditions()
-                    market_bias = market_conditions['market_bias']
-                    print(
-                        f"市场分析完成: {'看涨' if market_bias == 'bullish' else '看跌' if market_bias == 'bearish' else '中性'} 偏向")
-
-                # 获取账户余额
-                account_balance = self.get_futures_balance()
-                print(f"账户余额: {account_balance:.2f} USDC")
-                self.logger.info("账户余额", extra={"balance": account_balance})
-
-                if account_balance < self.config.get("MIN_MARGIN_BALANCE", 10):
-                    print(f"⚠️ 账户余额不足，最低要求: {self.config.get('MIN_MARGIN_BALANCE', 10)} USDC")
-                    self.logger.warning("账户余额不足", extra={"balance": account_balance,
-                                                               "min_required": self.config.get("MIN_MARGIN_BALANCE",
-                                                                                               10)})
-                    time.sleep(60)
-                    continue
-
-                # 管理现有持仓
-                self.manage_open_positions()
-
-                # 分析交易对并生成建议
-                trade_candidates = []
-                for symbol in self.config["TRADE_PAIRS"]:
-                    try:
-                        print(f"\n分析交易对: {symbol}")
-                        # 获取基础数据
-                        df = self.get_historical_data_with_cache(symbol, force_refresh=True)
-                        if df is None:
-                            print(f"❌ 无法获取{symbol}数据")
-                            continue
-
-                        # 使用新的信号生成函数
-                        signal, quality_score = self.generate_trade_signal(df, symbol)
-
-                        # 跳过保持信号
-                        if signal == "HOLD":
-                            print(f"⏸️ {symbol} 保持观望")
-                            continue
-
-                        # 检查原始信号是否为轻量级
-                        is_light = False
-                        # 临时获取原始信号
-                        _, _, details = self.mtf_coordinator.generate_signal(symbol, quality_score)
-                        raw_signal = details.get("coherence", {}).get("recommendation", "")
-                        if raw_signal.startswith("LIGHT_"):
-                            is_light = True
-                            print_colored(f"{symbol} 检测到轻量级信号，将使用较小仓位", Colors.YELLOW)
-
-                        # 获取当前价格
-                        try:
-                            ticker = self.client.futures_symbol_ticker(symbol=symbol)
-                            current_price = float(ticker['price'])
-                        except Exception as e:
-                            print(f"❌ 获取{symbol}价格失败: {e}")
-                            continue
-
-                        # 预测未来价格
-                        predicted = None
-                        if "price_prediction" in details and details["price_prediction"].get("valid", False):
-                            predicted = details["price_prediction"]["predicted_price"]
-                        else:
-                            predicted = self.predict_short_term_price(symbol, horizon_minutes=90)  # 使用90分钟预测
-
-                        if predicted is None:
-                            predicted = current_price * (1.05 if signal == "BUY" else 0.95)  # 默认5%变动
-
-                        # 计算预期价格变动百分比
-                        expected_movement = abs(predicted - current_price) / current_price * 100
-
-                        # 如果预期变动小于2.5%，则跳过交易
-                        if expected_movement < 2.5:
-                            print_colored(
-                                f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求(2.5%)，跳过交易",
-                                Colors.WARNING)
-                            continue
-
-                        # 计算风险和交易金额
-                        risk = expected_movement / 100  # 预期变动作为风险指标
-
-                        # 计算交易金额时考虑轻量级信号
-                        candidate_amount = self.calculate_dynamic_order_amount(risk, account_balance)
-                        if is_light:
-                            candidate_amount *= 0.5  # 轻量级信号使用半仓
-                            print_colored(f"{symbol} 轻量级信号，使用50%标准仓位: {candidate_amount:.2f} USDC",
-                                          Colors.YELLOW)
-
-                        # 添加到候选列表
-                        candidate = {
-                            "symbol": symbol,
-                            "signal": signal,
-                            "quality_score": quality_score,
-                            "current_price": current_price,
-                            "predicted_price": predicted,
-                            "risk": risk,
-                            "amount": candidate_amount,
-                            "is_light": is_light,
-                            "expected_movement": expected_movement
-                        }
-
-                        trade_candidates.append(candidate)
-
-                        print_colored(
-                            f"候选交易: {symbol} {signal}, "
-                            f"质量评分: {quality_score:.2f}, "
-                            f"预期波动: {expected_movement:.2f}%, "
-                            f"下单金额: {candidate_amount:.2f} USDC",
-                            Colors.GREEN if signal == "BUY" else Colors.RED
-                        )
-
-                    except Exception as e:
-                        self.logger.error(f"处理{symbol}时出错: {e}")
-                        print(f"❌ 处理{symbol}时出错: {e}")
-
-                # 按质量评分排序候选交易
-                trade_candidates.sort(key=lambda x: x["quality_score"], reverse=True)
-
-                # 显示详细交易计划
-                if trade_candidates:
-                    print("\n==== 详细交易计划 ====")
-                    for idx, candidate in enumerate(trade_candidates, 1):
-                        symbol = candidate["symbol"]
-                        signal = candidate["signal"]
-                        quality = candidate["quality_score"]
-                        current = candidate["current_price"]
-                        predicted = candidate["predicted_price"]
-                        amount = candidate["amount"]
-                        is_light = candidate["is_light"]
-                        expected_movement = candidate["expected_movement"]
-
-                        side_color = Colors.GREEN if signal == "BUY" else Colors.RED
-                        position_type = "轻仓位" if is_light else "标准仓位"
-
-                        print(f"\n{idx}. {symbol} - {side_color}{signal}{Colors.RESET} ({position_type})")
-                        print(f"   质量评分: {quality:.2f}")
-                        print(f"   当前价格: {current:.6f}, 预测价格: {predicted:.6f}")
-                        print(f"   预期波动: {expected_movement:.2f}%")
-                        print(f"   下单金额: {amount:.2f} USDC")
-                else:
-                    print("\n本轮无交易候选")
-
-                # 执行交易
-                executed_count = 0
-                max_trades = min(self.config.get("MAX_PURCHASES_PER_ROUND", 3), len(trade_candidates))
-
-                for candidate in trade_candidates:
-                    if executed_count >= max_trades:
-                        break
-
-                    symbol = candidate["symbol"]
-                    signal = candidate["signal"]
-                    amount = candidate["amount"]
-                    quality_score = candidate["quality_score"]
-                    is_light = candidate["is_light"]
-
-                    print(f"\n🚀 执行交易: {symbol} {signal}, 金额: {amount:.2f} USDC{' (轻仓位)' if is_light else ''}")
-
-                    # 计算适合的杠杆水平
-                    leverage = self.calculate_leverage_from_quality(quality_score)
-                    if is_light:
-                        # 轻仓位降低杠杆
-                        leverage = max(1, int(leverage * 0.7))
-                        print_colored(f"轻仓位降低杠杆至 {leverage}倍", Colors.YELLOW)
-
-                    # 执行交易
-                    if self.place_futures_order_usdc(symbol, signal, amount, leverage):
-                        executed_count += 1
-                        print(f"✅ {symbol} {signal} 交易成功")
-                    else:
-                        print(f"❌ {symbol} {signal} 交易失败")
-
-                # 显示持仓卖出预测
-                self.display_position_sell_timing()
-
-                # 打印交易循环总结
-                print(f"\n==== 交易循环总结 ====")
-                print(f"分析交易对: {len(self.config['TRADE_PAIRS'])}个")
-                print(f"交易候选: {len(trade_candidates)}个")
-                print(f"执行交易: {executed_count}个")
-
-                # 循环间隔
-                sleep_time = 60
-                print(f"\n等待 {sleep_time} 秒进入下一轮...")
-                time.sleep(sleep_time)
-
-            except KeyboardInterrupt:
-                print("\n用户中断，退出程序")
-                self.logger.info("用户中断，程序结束")
-                break
-            except Exception as e:
-                self.logger.error(f"交易循环异常: {e}")
-                print(f"错误: {e}")
-                time.sleep(30)
 
     def is_near_resistance(self, price, swing_highs, fib_levels, threshold=0.01):
         """检查价格是否接近阻力位"""
@@ -625,7 +456,7 @@ class EnhancedTradingBot:
         return False
 
     def adapt_to_market_conditions(self):
-        """根据市场条件动态调整交易参数 - 改进版，增强健壮性"""
+        """根据市场条件动态调整交易参数 - 改进版，支持跟踪止损系统"""
         print("\n===== 市场条件分析与参数适配 =====")
 
         # 分析当前市场波动性
@@ -773,44 +604,62 @@ class EnhancedTradingBot:
         else:
             avg_trend_strength = 20.0  # 默认值
 
-        # 根据市场条件调整交易参数
+        # 根据市场条件调整交易参数 - 适配跟踪止损系统
         # 1. 波动性调整
         if avg_volatility > 1.5:  # 市场波动性高于平均50%
             # 高波动环境
-            self.dynamic_stop_loss = -0.020  # 加大止损到2.0%
-            self.trailing_activation = 0.015  # 提高激活阈值到1.5%
-            print(f"⚠️ 市场波动性较高，调整初始止损至2.0%，跟踪激活阈值至1.5%")
+            initial_stop_loss = 0.020  # 加大初始止损到2.0%
+            trailing_activation = 0.015  # 提高激活阈值到1.5%
+            trailing_distance_min = 0.003  # 维持标准跟踪距离0.3%
+            trailing_distance_max = 0.005  # 增加最大跟踪距离到0.5%
+
+            print(f"⚠️ 市场波动性较高，调整初始止损至2.0%，跟踪激活阈值至1.5%，跟踪距离0.3-0.5%")
 
             # 记录调整
             self.logger.info("市场波动性高，调整交易参数", extra={
                 "volatility": avg_volatility,
-                "take_profit": self.dynamic_take_profit,
-                "stop_loss": self.dynamic_stop_loss
+                "initial_stop_loss": initial_stop_loss,
+                "trailing_activation": trailing_activation,
+                "trailing_distance_range": f"{trailing_distance_min}-{trailing_distance_max}"
             })
         elif avg_volatility < 0.7:  # 市场波动性低于平均30%
             # 低波动环境
-            self.dynamic_take_profit = 0.020  # 降低止盈到2.0%
-            self.dynamic_stop_loss = -0.015  # 缩小止损到1.5%
-            print(f"ℹ️ 市场波动性较低，调整止盈至2.0%，止损至1.5%")
+            initial_stop_loss = 0.006  # 缩小初始止损到0.6%
+            trailing_activation = 0.010  # 降低激活阈值到1.0%
+            trailing_distance_min = 0.001  # 降低最小跟踪距离到0.1%
+            trailing_distance_max = 0.002  # 降低最大跟踪距离到0.2%
+
+            print(f"ℹ️ 市场波动性较低，调整初始止损至0.6%，跟踪激活阈值至1.0%，跟踪距离0.1-0.2%")
 
             # 记录调整
             self.logger.info("市场波动性低，调整交易参数", extra={
                 "volatility": avg_volatility,
-                "take_profit": self.dynamic_take_profit,
-                "stop_loss": self.dynamic_stop_loss
+                "initial_stop_loss": initial_stop_loss,
+                "trailing_activation": trailing_activation,
+                "trailing_distance_range": f"{trailing_distance_min}-{trailing_distance_max}"
             })
         else:
-            # 正常波动环境，恢复默认值
-            self.dynamic_take_profit = 0.025  # 恢复默认2.5%
-            self.dynamic_stop_loss = -0.0175  # 恢复默认1.75%
-            print(f"ℹ️ 市场波动性正常，使用默认止盈止损")
+            # 正常波动环境，使用默认值
+            initial_stop_loss = 0.008  # 默认初始止损0.8%
+            trailing_activation = 0.012  # 默认激活阈值1.2%
+            trailing_distance_min = 0.002  # 默认最小跟踪距离0.2%
+            trailing_distance_max = 0.004  # 默认最大跟踪距离0.4%
+
+            print(f"ℹ️ 市场波动性正常，使用默认跟踪止损参数 (初始止损0.8%，激活阈值1.2%，跟踪距离0.2-0.4%)")
 
             # 记录使用默认值
             self.logger.info("市场波动性正常，使用默认参数", extra={
                 "volatility": avg_volatility,
-                "take_profit": self.dynamic_take_profit,
-                "stop_loss": self.dynamic_stop_loss
+                "initial_stop_loss": initial_stop_loss,
+                "trailing_activation": trailing_activation,
+                "trailing_distance_range": f"{trailing_distance_min}-{trailing_distance_max}"
             })
+
+        # 更新参数
+        self.dynamic_stop_loss = -initial_stop_loss  # 保持接口兼容性，但现在表示初始止损
+        self.trailing_activation = trailing_activation
+        self.trailing_min_distance = trailing_distance_min
+        self.trailing_max_distance = trailing_distance_max
 
         # 2. 市场情绪调整
         self.market_bias = market_bias
@@ -833,10 +682,13 @@ class EnhancedTradingBot:
             "volatility": avg_volatility if 'avg_volatility' in locals() else 1.0,
             "trend_strength": avg_trend_strength if 'avg_trend_strength' in locals() else 20.0,
             "btc_change": btc_price_change,
-            "take_profit": self.dynamic_take_profit,
-            "stop_loss": self.dynamic_stop_loss,
+            "initial_stop_loss": initial_stop_loss,
+            "trailing_activation": trailing_activation,
+            "trailing_distance_min": trailing_distance_min,
+            "trailing_distance_max": trailing_distance_max,
             "market_bias": self.market_bias
         }
+
 
     def is_near_support(self, price, swing_lows, fib_levels, threshold=0.01):
         """检查价格是否接近支撑位"""
@@ -1122,8 +974,8 @@ class EnhancedTradingBot:
             expected_movement = abs(predicted_price - current_price) / current_price * 100
             print_colored(f"{symbol} 预期价格变动: {expected_movement:.2f}%", Colors.INFO)
 
-            # 降低最小预期变动要求 (从2.5%改为1.0%)
-            min_movement = 1.0
+            # 使用更低的最小预期变动要求 (从2.5%改为1.25%)
+            min_movement = 1.25  # 已修改为1.25%
 
             # 只有当信号明确为"NEUTRAL"且预期变动很小时才保持观望
             if signal == "NEUTRAL" and expected_movement < min_movement:
@@ -1245,16 +1097,7 @@ class EnhancedTradingBot:
 
     def place_futures_order_usdc(self, symbol: str, side: str, amount: float, leverage: int = 5) -> bool:
         """
-        执行期货市场订单 - 改进版本，使用动态跟踪止损，无固定止盈
-
-        参数:
-            symbol: 交易对符号
-            side: 交易方向 ('BUY' 或 'SELL')
-            amount: 交易金额(USDC)
-            leverage: 杠杆倍数
-
-        返回:
-            bool: 交易是否成功
+        执行期货市场订单 - 改进版本，添加错误处理和默认精度
         """
         import math
         import time
@@ -1277,15 +1120,20 @@ class EnhancedTradingBot:
             # 计算预期价格变动百分比
             expected_movement = abs(predicted_price - current_price) / current_price * 100
 
-            # 修改为使用更低的预期变动阈值: 1.25%
-            if expected_movement < 1.25:
-                print_colored(f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求(1.25%)", Colors.WARNING)
-                self.logger.warning(f"{symbol}预期变动不足", extra={"expected_movement": expected_movement})
+            # 使用更低的预期变动阈值: 1.35%
+            min_movement_threshold = 1.35  # 固定为1.35%
+
+            if expected_movement < min_movement_threshold:
+                print_colored(
+                    f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求({min_movement_threshold:.2f}%)",
+                    Colors.WARNING)
+                self.logger.warning(f"{symbol}预期变动不足", extra={"expected_movement": expected_movement,
+                                                                    "min_required": min_movement_threshold})
                 return False
 
             # ==== 动态跟踪止损计算 ====
             # 基础止损比例 - 根据波动率和预期方向调整
-            initial_stop_loss = -0.008  # 初始固定止损0.8%
+            initial_stop_loss = 0.008  # 初始固定止损0.8%
 
             # 启动跟踪止损的阈值
             trailing_activation_threshold = 0.012  # 当价格向有利方向移动1.2%时激活跟踪止损
@@ -1312,31 +1160,64 @@ class EnhancedTradingBot:
                 amount = min_amount
                 print(f"⚠️ 订单金额已调整至最低限额: {min_amount} USDC")
 
-            # 获取交易对信息
-            info = self.client.futures_exchange_info()
-
+            # 获取交易对信息，添加错误处理和默认值
             step_size = None
             min_qty = None
+            max_qty = None
             notional_min = None
 
-            # 查找该交易对的所有过滤器
-            for item in info['symbols']:
-                if item['symbol'] == symbol:
-                    for f in item['filters']:
-                        # 数量精度
-                        if f['filterType'] == 'LOT_SIZE':
-                            step_size = float(f['stepSize'])
-                            min_qty = float(f['minQty'])
-                            max_qty = float(f['maxQty'])
-                        # 最小订单价值
-                        elif f['filterType'] == 'MIN_NOTIONAL':
-                            notional_min = float(f.get('notional', 0))
-                        break
+            try:
+                # 获取交易对信息
+                info = self.client.futures_exchange_info()
 
-            # 确保找到了必要的信息
+                # 查找该交易对的所有过滤器
+                for item in info['symbols']:
+                    if item['symbol'] == symbol:
+                        for f in item['filters']:
+                            # 数量精度
+                            if f['filterType'] == 'LOT_SIZE':
+                                step_size = float(f['stepSize'])
+                                min_qty = float(f['minQty'])
+                                max_qty = float(f['maxQty'])
+                            # 最小订单价值
+                            elif f['filterType'] == 'MIN_NOTIONAL':
+                                notional_min = float(f.get('notional', 0))
+                        break
+            except Exception as e:
+                print_colored(f"⚠️ 获取{symbol}交易信息失败: {e}，使用默认值", Colors.WARNING)
+                self.logger.warning(f"获取交易信息失败: {e}", extra={"symbol": symbol})
+
+            # 如果无法获取交易信息，使用安全的默认值
             if step_size is None:
-                print_colored(f"❌ {symbol} 无法获取交易精度信息", Colors.ERROR)
-                return False
+                print_colored(f"⚠️ {symbol} 无法获取精度信息，使用默认值", Colors.WARNING)
+
+                # 根据价格范围设置合理的默认值
+                if current_price < 0.1:
+                    step_size = 1  # 小币种通常可以买整数个
+                    min_qty = 1
+                    max_qty = 9000000
+                elif current_price < 1:
+                    step_size = 0.1
+                    min_qty = 0.1
+                    max_qty = 900000
+                elif current_price < 10:
+                    step_size = 0.01
+                    min_qty = 0.01
+                    max_qty = 90000
+                elif current_price < 100:
+                    step_size = 0.001
+                    min_qty = 0.001
+                    max_qty = 9000
+                elif current_price < 1000:
+                    step_size = 0.0001
+                    min_qty = 0.0001
+                    max_qty = 900
+                else:
+                    step_size = 0.00001
+                    min_qty = 0.00001
+                    max_qty = 90
+
+                notional_min = 5  # 大多数交易所的最低订单价值是5 USDT/USDC
 
             # 计算数量并应用精度限制
             raw_qty = amount / current_price
@@ -1348,7 +1229,7 @@ class EnhancedTradingBot:
                 return False
 
             # 应用数量精度
-            precision = int(round(-math.log(step_size, 10), 0))
+            precision = int(round(-math.log(step_size, 10), 0)) if step_size < 1 else 0
             quantity = math.floor(raw_qty * 10 ** precision) / 10 ** precision
 
             # 确保数量>=最小数量
@@ -1356,8 +1237,16 @@ class EnhancedTradingBot:
                 print_colored(f"⚠️ {symbol} 数量 {quantity} 小于最小交易量 {min_qty}，已调整", Colors.WARNING)
                 quantity = min_qty
 
+            # 确保数量<=最大数量
+            if max_qty and quantity > max_qty:
+                print_colored(f"⚠️ {symbol} 数量 {quantity} 大于最大交易量 {max_qty}，已调整", Colors.WARNING)
+                quantity = max_qty
+
             # 格式化为字符串(避免科学计数法问题)
-            qty_str = f"{quantity:.{precision}f}"
+            if precision > 0:
+                qty_str = f"{quantity:.{precision}f}"
+            else:
+                qty_str = str(int(quantity))
 
             # 检查最小订单价值
             notional = quantity * current_price
@@ -1365,7 +1254,13 @@ class EnhancedTradingBot:
                 print_colored(f"⚠️ {symbol} 订单价值 ({notional:.2f}) 低于最小要求 ({notional_min})", Colors.WARNING)
                 new_qty = math.ceil(notional_min / current_price * 10 ** precision) / 10 ** precision
                 quantity = max(min_qty, new_qty)
-                qty_str = f"{quantity:.{precision}f}"
+
+                # 更新格式化后的数量字符串
+                if precision > 0:
+                    qty_str = f"{quantity:.{precision}f}"
+                else:
+                    qty_str = str(int(quantity))
+
                 notional = quantity * current_price
 
             print_colored(f"🔢 {symbol} 计划交易: 金额={amount:.2f} USDC, 数量={quantity}, 价格={current_price}",
@@ -1421,7 +1316,7 @@ class EnhancedTradingBot:
                     side=side,
                     entry_price=current_price,
                     quantity=quantity,
-                    initial_stop_loss=initial_stop_loss,  # 初始固定止损
+                    initial_stop_loss=initial_stop_loss if side.upper() == "SELL" else -initial_stop_loss,  # 根据方向设置符号
                     trailing_activation=trailing_activation_threshold,  # 激活跟踪的阈值
                     trailing_distance=trailing_distance  # 跟踪距离
                 )
@@ -1449,6 +1344,245 @@ class EnhancedTradingBot:
             print_colored(f"❌ {symbol} {side} 交易过程中发生错误: {e}", Colors.ERROR)
             self.logger.error(f"{symbol} 交易错误", extra={"error": str(e)})
             return False
+
+    def trade(self):
+        """增强版多时框架集成交易循环，包含主动持仓监控"""
+        import threading
+
+        print("启动增强版多时间框架集成交易机器人...")
+        self.logger.info("增强版多时间框架集成交易机器人启动", extra={"version": "Enhanced-MTF-" + VERSION})
+
+        # 在单独的线程中启动主动持仓监控
+        monitor_thread = threading.Thread(target=self.active_position_monitor, args=(15,), daemon=True)
+        monitor_thread.start()
+        print("✅ 主动持仓监控已在后台启动（每15秒检查一次）")
+
+        # 初始化API连接
+        self.check_and_reconnect_api()
+
+        # 转换现有持仓到跟踪止损系统
+        self.convert_positions_to_trailing_stop()
+
+        # 最低质量评分要求 - 新增的参数设置
+        min_quality_score = 7.80  # 只购买评分7.80及以上的交易对
+        print(f"✅ 设置最低质量评分要求: {min_quality_score}")
+
+        while True:
+            try:
+                self.trade_cycle += 1
+                print(f"\n======== 交易循环 #{self.trade_cycle} ========")
+                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"当前时间: {current_time}")
+
+                # 每10个周期运行资源管理和API检查
+                if self.trade_cycle % 10 == 0:
+                    self.manage_resources()
+                    self.check_and_reconnect_api()
+
+                # 每5个周期分析一次市场条件
+                if self.trade_cycle % 5 == 0:
+                    print("\n----- 分析市场条件 -----")
+                    market_conditions = self.adapt_to_market_conditions()
+                    market_bias = market_conditions['market_bias']
+                    print(
+                        f"市场分析完成: {'看涨' if market_bias == 'bullish' else '看跌' if market_bias == 'bearish' else '中性'} 偏向")
+
+                # 获取账户余额
+                account_balance = self.get_futures_balance()
+                print(f"账户余额: {account_balance:.2f} USDC")
+                self.logger.info("账户余额", extra={"balance": account_balance})
+
+                if account_balance < self.config.get("MIN_MARGIN_BALANCE", 10):
+                    print(f"⚠️ 账户余额不足，最低要求: {self.config.get('MIN_MARGIN_BALANCE', 10)} USDC")
+                    self.logger.warning("账户余额不足", extra={"balance": account_balance,
+                                                               "min_required": self.config.get("MIN_MARGIN_BALANCE",
+                                                                                               10)})
+                    time.sleep(60)
+                    continue
+
+                # 管理现有持仓
+                self.manage_open_positions()
+
+                # 分析交易对并生成建议
+                trade_candidates = []
+                for symbol in self.config["TRADE_PAIRS"]:
+                    try:
+                        print(f"\n分析交易对: {symbol}")
+                        # 获取基础数据
+                        df = self.get_historical_data_with_cache(symbol, force_refresh=True)
+                        if df is None:
+                            print(f"❌ 无法获取{symbol}数据")
+                            continue
+
+                        # 使用新的信号生成函数
+                        signal, quality_score = self.generate_trade_signal(df, symbol)
+
+                        # 跳过保持信号
+                        if signal == "HOLD":
+                            print(f"⏸️ {symbol} 保持观望")
+                            continue
+
+                        # 检查质量评分是否达到最低要求 - 新增的筛选条件
+                        if quality_score < min_quality_score:
+                            print_colored(
+                                f"⚠️ {symbol} 质量评分 ({quality_score:.2f}) 低于最低要求 ({min_quality_score:.2f})，跳过交易",
+                                Colors.YELLOW)
+                            continue
+
+                        # 检查原始信号是否为轻量级
+                        is_light = False
+                        # 临时获取原始信号
+                        _, _, details = self.mtf_coordinator.generate_signal(symbol, quality_score)
+                        raw_signal = details.get("coherence", {}).get("recommendation", "")
+                        if raw_signal.startswith("LIGHT_"):
+                            is_light = True
+                            print_colored(f"{symbol} 检测到轻量级信号，将使用较小仓位", Colors.YELLOW)
+
+                        # 获取当前价格
+                        try:
+                            ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                            current_price = float(ticker['price'])
+                        except Exception as e:
+                            print(f"❌ 获取{symbol}价格失败: {e}")
+                            continue
+
+                        # 预测未来价格
+                        predicted = None
+                        if "price_prediction" in details and details["price_prediction"].get("valid", False):
+                            predicted = details["price_prediction"]["predicted_price"]
+                        else:
+                            predicted = self.predict_short_term_price(symbol, horizon_minutes=90)  # 使用90分钟预测
+
+                        if predicted is None:
+                            predicted = current_price * (1.05 if signal == "BUY" else 0.95)  # 默认5%变动
+
+                        # 计算预期价格变动百分比
+                        expected_movement = abs(predicted - current_price) / current_price * 100
+
+                        # 使用固定的预期变动阈值: 1.35%
+                        if expected_movement < 1.35:
+                            print_colored(
+                                f"⚠️ {symbol}的预期价格变动({expected_movement:.2f}%)小于最低要求(1.35%)，跳过交易",
+                                Colors.WARNING)
+                            continue
+
+                        # 计算风险和交易金额
+                        risk = expected_movement / 100  # 预期变动作为风险指标
+
+                        # 计算交易金额时考虑轻量级信号
+                        candidate_amount = self.calculate_dynamic_order_amount(risk, account_balance)
+                        if is_light:
+                            candidate_amount *= 0.5  # 轻量级信号使用半仓
+                            print_colored(f"{symbol} 轻量级信号，使用50%标准仓位: {candidate_amount:.2f} USDC",
+                                          Colors.YELLOW)
+
+                        # 添加到候选列表
+                        candidate = {
+                            "symbol": symbol,
+                            "signal": signal,
+                            "quality_score": quality_score,
+                            "current_price": current_price,
+                            "predicted_price": predicted,
+                            "risk": risk,
+                            "amount": candidate_amount,
+                            "is_light": is_light,
+                            "expected_movement": expected_movement
+                        }
+
+                        trade_candidates.append(candidate)
+
+                        print_colored(
+                            f"候选交易: {symbol} {signal}, "
+                            f"质量评分: {quality_score:.2f}, "
+                            f"预期波动: {expected_movement:.2f}%, "
+                            f"下单金额: {candidate_amount:.2f} USDC",
+                            Colors.GREEN if signal == "BUY" else Colors.RED
+                        )
+
+                    except Exception as e:
+                        self.logger.error(f"处理{symbol}时出错: {e}")
+                        print(f"❌ 处理{symbol}时出错: {e}")
+
+                # 按质量评分排序候选交易
+                trade_candidates.sort(key=lambda x: x["quality_score"], reverse=True)
+
+                # 显示详细交易计划
+                if trade_candidates:
+                    print("\n==== 详细交易计划 ====")
+                    for idx, candidate in enumerate(trade_candidates, 1):
+                        symbol = candidate["symbol"]
+                        signal = candidate["signal"]
+                        quality = candidate["quality_score"]
+                        current = candidate["current_price"]
+                        predicted = candidate["predicted_price"]
+                        amount = candidate["amount"]
+                        is_light = candidate["is_light"]
+                        expected_movement = candidate["expected_movement"]
+
+                        side_color = Colors.GREEN if signal == "BUY" else Colors.RED
+                        position_type = "轻仓位" if is_light else "标准仓位"
+
+                        print(f"\n{idx}. {symbol} - {side_color}{signal}{Colors.RESET} ({position_type})")
+                        print(f"   质量评分: {quality:.2f}")
+                        print(f"   当前价格: {current:.6f}, 预测价格: {predicted:.6f}")
+                        print(f"   预期波动: {expected_movement:.2f}%")
+                        print(f"   下单金额: {amount:.2f} USDC")
+                else:
+                    print("\n本轮无交易候选")
+
+                # 执行交易
+                executed_count = 0
+                max_trades = min(self.config.get("MAX_PURCHASES_PER_ROUND", 3), len(trade_candidates))
+
+                for candidate in trade_candidates:
+                    if executed_count >= max_trades:
+                        break
+
+                    symbol = candidate["symbol"]
+                    signal = candidate["signal"]
+                    amount = candidate["amount"]
+                    quality_score = candidate["quality_score"]
+                    is_light = candidate["is_light"]
+
+                    print(f"\n🚀 执行交易: {symbol} {signal}, 金额: {amount:.2f} USDC{' (轻仓位)' if is_light else ''}")
+
+                    # 计算适合的杠杆水平
+                    leverage = self.calculate_leverage_from_quality(quality_score)
+                    if is_light:
+                        # 轻仓位降低杠杆
+                        leverage = max(1, int(leverage * 0.7))
+                        print_colored(f"轻仓位降低杠杆至 {leverage}倍", Colors.YELLOW)
+
+                    # 执行交易
+                    if self.place_futures_order_usdc(symbol, signal, amount, leverage):
+                        executed_count += 1
+                        print(f"✅ {symbol} {signal} 交易成功")
+                    else:
+                        print(f"❌ {symbol} {signal} 交易失败")
+
+                # 显示持仓卖出预测
+                self.display_position_sell_timing()
+
+                # 打印交易循环总结
+                print(f"\n==== 交易循环总结 ====")
+                print(f"分析交易对: {len(self.config['TRADE_PAIRS'])}个")
+                print(f"交易候选: {len(trade_candidates)}个")
+                print(f"执行交易: {executed_count}个")
+                print(f"最低质量评分要求: {min_quality_score:.2f}")
+
+                # 循环间隔
+                sleep_time = 60
+                print(f"\n等待 {sleep_time} 秒进入下一轮...")
+                time.sleep(sleep_time)
+
+            except KeyboardInterrupt:
+                print("\n用户中断，退出程序")
+                self.logger.info("用户中断，程序结束")
+                break
+            except Exception as e:
+                self.logger.error(f"交易循环异常: {e}")
+                print(f"错误: {e}")
+                time.sleep(30)
 
     def calculate_upside_potential(self, symbol, side, current_price):
         """
@@ -1888,17 +2022,23 @@ class EnhancedTradingBot:
             self.logger.error(f"主动持仓监控错误", extra={"error": str(e)})
 
     def record_open_position(self, symbol, side, entry_price, quantity, take_profit=0.025, stop_loss=-0.0175):
-        """记录新开的持仓，使用固定的止盈止损比例
+        """
+        记录新开的持仓，转为使用跟踪止损系统替代固定止盈止损
 
         参数:
             symbol: 交易对符号
             side: 交易方向 ('BUY' 或 'SELL')
             entry_price: 入场价格
             quantity: 交易数量
-            take_profit: 止盈百分比，默认2.5%
-            stop_loss: 止损百分比，默认-1.75%
+            take_profit: 不再使用，保留参数兼容旧调用
+            stop_loss: 初始止损百分比，默认-1.75%
         """
         position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+
+        # 设置跟踪止损参数
+        initial_stop_loss = stop_loss  # 使用传入的止损比例
+        trailing_activation = 0.012  # 默认1.2%激活阈值
+        trailing_distance = 0.003  # 默认0.3%跟踪距离
 
         # 检查是否已有同方向持仓
         for i, pos in enumerate(self.open_positions):
@@ -1910,19 +2050,54 @@ class EnhancedTradingBot:
                 self.open_positions[i]["quantity"] = total_qty
                 self.open_positions[i]["last_update_time"] = time.time()
 
-                # 使用固定的止盈止损比例
-                self.open_positions[i]["dynamic_take_profit"] = take_profit  # 固定2.5%止盈
-                self.open_positions[i]["stop_loss"] = stop_loss  # 固定1.75%止损
+                # 更新为跟踪止损参数（如果尚未使用）
+                if "trailing_active" not in pos:
+                    # 计算初始止损价格
+                    if position_side == "LONG":
+                        current_stop_level = new_entry * (1 + initial_stop_loss)
+                        highest_price = new_entry
+                    else:  # SHORT
+                        current_stop_level = new_entry * (1 - initial_stop_loss)
+                        lowest_price = new_entry
+
+                    # 添加跟踪止损参数
+                    self.open_positions[i]["initial_stop_loss"] = initial_stop_loss
+                    self.open_positions[i]["trailing_activation"] = trailing_activation
+                    self.open_positions[i]["trailing_distance"] = trailing_distance
+                    self.open_positions[i]["trailing_active"] = False
+                    self.open_positions[i]["highest_price"] = highest_price if position_side == "LONG" else 0
+                    self.open_positions[i]["lowest_price"] = lowest_price if position_side == "SHORT" else float('inf')
+                    self.open_positions[i]["current_stop_level"] = current_stop_level
+
+                    # 移除旧的止盈止损参数
+                    if "dynamic_take_profit" in self.open_positions[i]:
+                        del self.open_positions[i]["dynamic_take_profit"]
+                    if "stop_loss" in self.open_positions[i]:
+                        del self.open_positions[i]["stop_loss"]
+
+                    print_colored(
+                        f"🔄 已将 {symbol} {position_side} 持仓转换为跟踪止损系统",
+                        Colors.CYAN
+                    )
 
                 self.logger.info(f"更新{symbol} {position_side}持仓", extra={
                     "new_entry_price": new_entry,
                     "total_quantity": total_qty,
-                    "take_profit": take_profit,
-                    "stop_loss": stop_loss
+                    "initial_stop_loss": initial_stop_loss,
+                    "trailing_activation": trailing_activation,
+                    "trailing_distance": trailing_distance
                 })
                 return
 
-        # 添加新持仓，使用固定的止盈止损比例
+        # 计算初始止损价格
+        if position_side == "LONG":
+            current_stop_level = entry_price * (1 + initial_stop_loss)
+            highest_price = entry_price
+        else:  # SHORT
+            current_stop_level = entry_price * (1 - initial_stop_loss)
+            lowest_price = entry_price
+
+        # 添加新持仓，使用跟踪止损系统
         new_pos = {
             "symbol": symbol,
             "side": side,
@@ -1932,21 +2107,30 @@ class EnhancedTradingBot:
             "open_time": time.time(),
             "last_update_time": time.time(),
             "max_profit": 0.0,
-            "dynamic_take_profit": take_profit,  # 固定2.5%止盈
-            "stop_loss": stop_loss,  # 固定1.75%止损
+            "initial_stop_loss": initial_stop_loss,
+            "trailing_activation": trailing_activation,
+            "trailing_distance": trailing_distance,
+            "trailing_active": False,
+            "highest_price": highest_price if position_side == "LONG" else 0,
+            "lowest_price": lowest_price if position_side == "SHORT" else float('inf'),
+            "current_stop_level": current_stop_level,
             "position_id": f"{symbol}_{position_side}_{int(time.time())}"
         }
 
         self.open_positions.append(new_pos)
         self.logger.info(f"新增{symbol} {position_side}持仓", extra={
             **new_pos,
-            "take_profit": take_profit,
-            "stop_loss": stop_loss
+            "initial_stop_loss": initial_stop_loss,
+            "trailing_activation": trailing_activation,
+            "trailing_distance": trailing_distance
         })
 
         print_colored(
-            f"📝 新增{symbol} {position_side}持仓，止盈: {take_profit * 100:.2f}%，止损: {abs(stop_loss) * 100:.2f}%",
-            Colors.GREEN + Colors.BOLD)
+            f"📝 新增{symbol} {position_side}持仓，初始止损: {abs(initial_stop_loss) * 100:.2f}%, "
+            f"跟踪激活阈值: {trailing_activation * 100:.1f}%, 跟踪距离: {trailing_distance * 100:.1f}%",
+            Colors.GREEN + Colors.BOLD
+        )
+
 
     def close_position(self, symbol, position_side=None):
         """平仓指定货币对的持仓，并记录历史"""

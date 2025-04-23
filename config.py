@@ -23,7 +23,7 @@ CONFIG = {
     "TRAILING_ACTIVATION": 0.012,  # 激活跟踪止损的价格变动阈值 (1.2%)
     "TRAILING_MIN_DISTANCE": 0.002,  # 最小跟踪距离 (0.2%)
     "TRAILING_MAX_DISTANCE": 0.004,  # 最大跟踪距离 (0.4%)
-    "MIN_PRICE_MOVEMENT": 0.0125,  # 最小价格变动阈值 (1.25%)
+    "MIN_PRICE_MOVEMENT": 0.0135#小价格变动阈值 (1.25%)
 }
 
 VERSION = "1.2.5.9.9"
